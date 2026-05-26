@@ -10,7 +10,7 @@ from threading import Lock
 
 log = logging.getLogger(__name__)
 
-CONFIG_PATH = "config.json"
+CONFIG_PATH = "data/config.json"
 
 
 class ConfigAdapter:

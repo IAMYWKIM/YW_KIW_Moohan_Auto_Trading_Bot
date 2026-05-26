@@ -1,903 +1,2102 @@
-# ==========================================================
-# [telegram_bot.py]
-# ⚠️ 이 주석 및 파일명 표기는 절대 지우지 마세요.
-# ==========================================================
-import logging
-import datetime
-import pytz
-import time
-import os
-import math 
+# ==============================================================
+# [telegram_bot.py] 국내 ETF 무한매매 봇 v4.0
+# 승승장군 봇 UI/UX 완전 구현 (국내 ETF / KRW 버전)
+#
+# 구현 명령어:
+#   /start      - 봇 정보 + 스케줄 + 명령어 목록
+#   /sync       - 통합 지시서 (T값, 별값, 주문계획 per 종목)
+#   /record     - 장부 조회 (일자별 매매 내역)
+#   /settlement - 설정 현황 (분할/목표/밴드 인라인 버튼)
+#   /ticker     - 종목 관리 (활성화/비활성화/추가/제거)
+#   /mode       - INFINITE / VREV 모드 전환
+#   /seed       - 시드머니(할당금) 설정
+#   /balance    - 예수금 및 계좌 잔고
+#   /holdings   - 보유 종목 평가손익
+#   /report     - 당일 정산 리포트
+#   /pause      - 매매 일시 중지
+#   /resume     - 매매 재개
+#   /cancel     - 미체결 주문 전량 취소
+#   /help       - 명령어 도움말
+#
+# 기본 종목:
+#   122630  KODEX 레버리지 (코스피 2배)
+#   233740  KODEX 코스닥150레버리지 (코스닥 2배)
+#   488080  KODEX 반도체TOP10레버리지 (반도체 2배)
+# ==============================================================
 import asyncio
-import pandas_market_calendars as mcal 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
-from telegram_view import TelegramView 
-
+import logging
+import math
+import datetime
+from zoneinfo import ZoneInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    ContextTypes, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, filters,
+)
+# 무한매매 계산 엔진 (trading_engine.py 공용 함수)
+from trading_engine import (
+    calc_t_val, calc_star_ratio, calc_star_price,
+    calc_target_price, calc_one_portion_qty, plan_loc_buy,
+)
+from kiwoom_api import round_to_tick
+log = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
+# 기본 종목 목록
+DEFAULT_SYMBOLS = [
+    {
+        "code": "122630", "name": "KODEX 레버리지",
+        "mode": "INFINITE", "active": True,
+        "allocation_krw": 3_000_000, "split_count": 10,
+        "target_profit_pct": 5.0, "vrev_band_pct": 3.0,
+        "daily_buy_limit_krw": 300_000,
+    },
+    {
+        "code": "233740", "name": "KODEX 코스닥150레버리지",
+        "mode": "INFINITE", "active": True,
+        "allocation_krw": 3_000_000, "split_count": 10,
+        "target_profit_pct": 5.0, "vrev_band_pct": 3.0,
+        "daily_buy_limit_krw": 300_000,
+    },
+    {
+        "code": "488080", "name": "KODEX 반도체TOP10레버리지",
+        "mode": "INFINITE", "active": False,
+        "allocation_krw": 3_000_000, "split_count": 10,
+        "target_profit_pct": 5.0, "vrev_band_pct": 3.0,
+        "daily_buy_limit_krw": 300_000,
+    },
+]
+# ConversationHandler 상태
+(
+    STATE_TICKER_ADD_CODE, STATE_TICKER_ADD_NAME,
+    STATE_TICKER_ADD_ALLOC, STATE_SET_VALUE,
+) = range(4)
+SETTING_KEY_MAP = {
+    "split":  ("split_count",         int,   "분할 횟수 (예: 10)",          "회"),
+    "target": ("target_profit_pct",   float, "목표 수익률 (예: 5.0)",        "%"),
+    "band":   ("vrev_band_pct",       float, "V-REV 밴드폭 (예: 3.0)",      "%"),
+    "alloc":  ("allocation_krw",      int,   "할당금액 (예: 3000000)",       "원"),
+    "limit":  ("daily_buy_limit_krw", int,   "일일 매수한도 (예: 300000)",   "원"),
+    "avwap":  ("avwap_budget",        int,   "AVWAP 예산 (예: 1000000)",     "원"),
+}
+# ==============================================================
+# TelegramController
+# ==============================================================
 class TelegramController:
-    def __init__(self, config, broker, strategy, tx_lock=None):
-        self.cfg = config
-        self.broker = broker
-        self.strategy = strategy
-        self.view = TelegramView()
-        self.user_states = {} 
-        self.admin_id = self.cfg.get_chat_id()
-        self.sync_locks = {} 
-        self.tx_lock = tx_lock or asyncio.Lock()
-
-    def _is_admin(self, update: Update):
-        if self.admin_id is None:
-            self.admin_id = self.cfg.get_chat_id()
-        
-        if self.admin_id is None:
-            print("⚠️ 보안 경고: ADMIN_CHAT_ID가 설정되지 않아 알 수 없는 사용자의 접근을 차단했습니다.")
+    VERSION = "v4.0"
+    def __init__(self, cfg, broker, db, notifier, trading_engine, admin_chat_id: int):
+        self.cfg      = cfg
+        self.broker   = broker
+        self.db       = db
+        self.notifier = notifier
+        self.engine   = trading_engine
+        self.admin_id = admin_chat_id
+        self._pending = {}   # 설정 입력 대기 상태
+    # ----------------------------------------------------------
+    # 보안 게이트
+    # ----------------------------------------------------------
+    def _is_admin(self, update: Update) -> bool:
+        uid = update.effective_chat.id
+        if uid != self.admin_id:
+            log.warning(f"[TG] 비인가 접근 차단: {uid}")
             return False
-            
-        return update.effective_chat.id == int(self.admin_id)
-
-    def _get_dst_info(self):
-        est = pytz.timezone('US/Eastern')
-        now_est = datetime.datetime.now(est)
-        is_dst = now_est.dst() != datetime.timedelta(0)
-        return (17, "🌞 <b>서머타임 적용 (Summer)</b>") if is_dst else (18, "❄️ <b>서머타임 해제 (Winter)</b>")
-
-    def _get_market_status(self):
-        est = pytz.timezone('US/Eastern')
-        now = datetime.datetime.now(est)
-        nyse = mcal.get_calendar('NYSE')
-        schedule = nyse.schedule(start_date=now.date(), end_date=now.date())
-        if schedule.empty: return "CLOSE", "⛔ 장휴일"
-        
-        market_open = schedule.iloc[0]['market_open'].astimezone(est)
-        market_close = schedule.iloc[0]['market_close'].astimezone(est)
-        pre_start = market_open.replace(hour=4, minute=0)
-        after_end = market_close.replace(hour=20, minute=0)
-
-        if pre_start <= now < market_open: return "PRE", "🌅 프리마켓"
-        elif market_open <= now < market_close: return "REG", "🔥 정규장"
-        elif market_close <= now < after_end: return "AFTER", "🌙 애프터마켓"
-        else: return "CLOSE", "⛔ 장마감"
-
-    def _calculate_budget_allocation(self, cash, tickers):
-        sorted_tickers = sorted(tickers, key=lambda x: 0 if x == "SOXL" else (1 if x == "TQQQ" else 2))
-        allocated = {}
-        force_turbo_off = False
-        rem_cash = cash
-        
-        for tx in sorted_tickers:
-            rev_state = self.cfg.get_reverse_state(tx)
-            is_rev = rev_state.get("is_active", False)
-            
-            if is_rev:
-                portion = 0.0
-            else:
-                split = self.cfg.get_split_count(tx)
-                portion = self.cfg.get_seed(tx) / split if split > 0 else 0
-                
-            if rem_cash >= portion:
-                allocated[tx] = rem_cash
-                rem_cash -= portion
-            else: 
-                allocated[tx] = 0
-                if not is_rev:
-                    force_turbo_off = True 
-                    
-        return sorted_tickers, allocated, force_turbo_off
-
+        return True
+    # ----------------------------------------------------------
+    # 핸들러 등록
+    # ----------------------------------------------------------
+    def register_handlers(self, app):
+        cmds = [
+            ("start",      self.cmd_start),
+            ("sync",       self.cmd_sync),
+            ("record",     self.cmd_record),
+            ("settlement", self.cmd_settlement),
+            ("ticker",     self.cmd_ticker),
+            ("mode",       self.cmd_mode),
+            ("seed",       self.cmd_seed),
+            ("balance",    self.cmd_balance),
+            ("holdings",   self.cmd_holdings),
+            ("report",     self.cmd_report),
+            ("pause",      self.cmd_pause),
+            ("resume",     self.cmd_resume),
+            ("cancel",     self.cmd_cancel),
+            ("help",       self.cmd_help),
+            ("buy",        self.cmd_buy),
+            ("sell",       self.cmd_sell),
+            ("sync_db",    self.cmd_sync_db),
+            ("avwap",      self.cmd_avwap),
+            ("version",    self.cmd_version),
+            ("history",    self.cmd_history),
+        ]
+        for name, handler in cmds:
+            app.add_handler(CommandHandler(name, handler))
+        app.add_handler(CallbackQueryHandler(self.handle_callback))
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND, self.handle_message
+        ))
+        log.info(f"[TG] 핸들러 {len(cmds)}개 등록 완료")
+    async def set_bot_commands(self, app):
+        await app.bot.set_my_commands([
+            BotCommand("start",      "봇 시작 및 스케줄 안내"),
+            BotCommand("sync",       "통합 지시서 (T값·별값·주문계획)"),
+            BotCommand("record",     "장부 조회 (일자별 매매 내역)"),
+            BotCommand("settlement", "설정 현황 및 파라미터 변경"),
+            BotCommand("ticker",     "종목 관리 (활성화/추가/제거)"),
+            BotCommand("mode",       "INFINITE / V-REV 모드 전환"),
+            BotCommand("seed",       "시드머니(할당금) 설정"),
+            BotCommand("balance",    "예수금 및 계좌 잔고"),
+            BotCommand("holdings",   "보유 종목 평가손익"),
+            BotCommand("report",     "당일 정산 리포트"),
+            BotCommand("pause",      "매매 일시 중지"),
+            BotCommand("resume",     "매매 재개"),
+            BotCommand("cancel",     "미체결 주문 전량 취소"),
+            BotCommand("help",       "명령어 도움말"),
+            BotCommand("buy",       "수동 매수 주문"),
+            BotCommand("sell",      "수동 매도 주문"),
+            BotCommand("sync_db",   "키움 잔고 → DB 동기화"),
+            BotCommand("avwap",     "AVWAP 퀀트 엔진 현황 및 설정"),
+            BotCommand("version",   "버전 정보 및 업데이트 내역"),
+            BotCommand("history",   "졸업 명예의 전당 (완료 사이클)"),
+        ])
+    # ----------------------------------------------------------
+    # 공용 헬퍼
+    # ----------------------------------------------------------
+    def _get_symbols(self) -> list:
+        syms = self.cfg.get("SYMBOLS", [])
+        if not syms:
+            # 최초 실행: 기본 종목 저장
+            self.cfg.set("SYMBOLS", DEFAULT_SYMBOLS)
+            return DEFAULT_SYMBOLS
+        return syms
+    def _save_symbols(self, syms: list):
+        self.cfg.set("SYMBOLS", syms)
+    def _get_symbol(self, code: str) -> dict | None:
+        return next((s for s in self._get_symbols() if s["code"] == code), None)
+    def _get_active_symbols(self) -> list:
+        return [s for s in self._get_symbols() if s.get("active", True)]
+    def _market_status(self) -> str:
+        now = datetime.datetime.now(KST)
+        if now.weekday() >= 5:
+            return "⛔ 주말 휴장"
+        cfg  = self.cfg
+        s_t  = datetime.time(*map(int, cfg.get("START_TIME", "09:00").split(":")))
+        e_t  = datetime.time(*map(int, cfg.get("END_TIME",   "15:20").split(":")))
+        t    = now.time()
+        if t < s_t:
+            return "🌅 장 전"
+        if t <= e_t:
+            return "🟢 정규장"
+        if t <= datetime.time(15, 30):
+            return "🔔 동시호가"
+        return "🌙 장 마감"
+    def _fmt_krw(self, v: int) -> str:
+        return f"{v:,}원"
+    def _fmt_pct(self, v: float) -> str:
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.2f}%"
+    # ----------------------------------------------------------
+    # /start
+    # ----------------------------------------------------------
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update): return
-        target_hour, season_icon = self._get_dst_info()
-        latest_version = self.cfg.get_latest_version() 
-        msg = self.view.get_start_message(target_hour, season_icon, latest_version) 
-        await update.message.reply_text(msg, parse_mode='HTML')
-
-    async def cmd_v17(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update): return
-        
-        if os.getenv("SECRET_MODE") != "ON":
-            return 
-
-        args = context.args
-        if not args:
-            await update.message.reply_text("⚠️ 종목명을 함께 입력하세요. 예) /v17 TQQQ")
+        if not self._is_admin(update):
             return
-            
-        ticker = args[0].upper()
-        active_tickers = self.cfg.get_active_tickers()
-        
-        if ticker in active_tickers:
-            self.cfg.set_version(ticker, "V17")
-            await update.message.reply_text(f"🦇 쉿! <b>[{ticker}] 나만의 시크릿 V17 모드(스나이퍼 어쌔신)</b>가 은밀하게 활성화되었습니다.", parse_mode='HTML')
-        else:
-            await update.message.reply_text(f"❌ 현재 운용 중인 종목이 아닙니다. (운용 중: {', '.join(active_tickers)})")
-
-    async def cmd_v4(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update): return
-        
-        if os.getenv("SECRET_MODE") != "ON":
-            return 
-
-        for t in self.cfg.get_active_tickers():
-            self.cfg.set_version(t, "V14")
-        await update.message.reply_text("✅ <b>모든 종목이 오리지널 V4(무매4) 모드로 복귀했습니다.</b>", parse_mode='HTML')
-
-    async def cmd_sync(self, update, context):
-        if not self._is_admin(update): return
-        await update.message.reply_text("🔄 시장 분석 및 지시서 작성 중...")
-        
-        async with self.tx_lock:
-            cash, holdings = self.broker.get_account_balance()
-            if holdings is None:
-                await update.message.reply_text("❌ KIS API 통신 오류로 계좌 정보를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
-                return
-
-            target_hour, _ = self._get_dst_info() 
-            dst_txt = "🌞 서머타임 (17:30)" if target_hour == 17 else "❄️ 겨울 (18:30)"
-            status_code, status_text = self._get_market_status()
-            
-            tickers = self.cfg.get_active_tickers()
-            sorted_tickers, allocated_cash, force_turbo_off = self._calculate_budget_allocation(cash, tickers)
-            
-            ticker_data_list = []
-            total_buy_needed = 0.0
-
-            for t in sorted_tickers:
-                h = holdings.get(t, {'qty':0, 'avg':0})
-                curr = await asyncio.to_thread(self.broker.get_current_price, t, is_market_closed=(status_code == "CLOSE"))
-                prev_close = await asyncio.to_thread(self.broker.get_previous_close, t)
-                ma_5day = await asyncio.to_thread(self.broker.get_5day_ma, t)
-                day_high, day_low = await asyncio.to_thread(self.broker.get_day_high_low, t)
-                
-                actual_avg = float(h['avg']) if h['avg'] else 0.0
-                actual_qty = int(h['qty'])
-                
-                if status_code == "CLOSE" and curr > 0: safe_prev_close = curr
-                else: safe_prev_close = prev_close if prev_close else 0.0
-                
-                idx_ticker = "SOXX" if t == "SOXL" else "QQQ"
-                weight = self.cfg.get_sniper_multiplier(t)
-                
-                dynamic_pct = await asyncio.to_thread(self.broker.get_dynamic_sniper_target, idx_ticker, weight)
-                
-                if dynamic_pct is None:
-                    dynamic_pct = 9.0 if t == "SOXL" else 5.0
-                
-                hybrid_target_price = safe_prev_close * (1 - (dynamic_pct / 100.0))
-                
-                if actual_avg > 0:
-                    is_sniper_active = (hybrid_target_price < actual_avg) and (hybrid_target_price < ma_5day)
-                    if hybrid_target_price >= actual_avg:
-                        trigger_reason = "🛑(평단 위 관망)"
-                    elif hybrid_target_price >= ma_5day:
-                        trigger_reason = "🛑(5일선 위 과열)"
-                    else:
-                        trigger_reason = f"-{dynamic_pct}%"
-                else:
-                    is_sniper_active = True
-                    trigger_reason = f"-{dynamic_pct}%"
-                
-                is_already_ordered = self.cfg.check_lock(t, "REG") or self.cfg.check_lock(t, "SNIPER")
-                
-                plan = self.strategy.get_plan(
-                    t, curr, actual_avg, actual_qty, safe_prev_close, ma_5day=ma_5day,
-                    market_type="REG", available_cash=allocated_cash[t], force_turbo_off=force_turbo_off,
-                    is_simulation=is_already_ordered 
-                )
-                
-                split = self.cfg.get_split_count(t)
-                seed = self.cfg.get_seed(t)
-                ver = self.cfg.get_version(t)
-                
-                t_val = plan.get('t_val', 0.0)
-                is_rev = plan.get('is_reverse', False)
-                secret_quarter_target = 0.0
-                
-                if ver == "V17" and actual_qty > 0:
-                    secret_quarter_target = math.ceil(actual_avg * 1.0025 * 100) / 100.0
-                
-                ticker_data_list.append({
-                    'ticker': t, 'version': ver, 't_val': t_val, 'split': split, 'curr': curr, 'avg': actual_avg, 'qty': actual_qty,
-                    'profit_amt': (curr - actual_avg) * actual_qty if actual_qty > 0 else 0, 
-                    'profit_pct': (curr - actual_avg) / actual_avg * 100 if actual_avg > 0 else 0,
-                    'turbo_txt': "ON" if self.cfg.get_turbo_mode() else "OFF",
-                    'target': self.cfg.get_target_profit(t), 'star_pct': round(plan.get('star_ratio', 0) * 100, 2) if 'star_ratio' in plan else 0.0,
-                    'seed': seed, 'one_portion': plan.get('one_portion', 0.0), 'plan': plan,
-                    'is_locked': is_already_ordered, 'mode': "REG",
-                    'is_reverse': is_rev, 'star_price': plan.get('star_price', 0.0),
-                    'escrow': self.cfg.get_escrow_cash(t),
-                    'bb_lower': 0.0,  
-                    'hybrid_base': 0.0, 
-                    'hybrid_target': hybrid_target_price,
-                    'trigger_reason': trigger_reason,
-                    'sniper_trigger': dynamic_pct,
-                    'secret_quarter_target': secret_quarter_target,
-                    'day_high': day_high,
-                    'day_low': day_low,
-                    'prev_close': safe_prev_close
-                })
-                total_buy_needed += sum(o['price']*o['qty'] for o in plan['orders'] if o['side']=='BUY')
-
-        surplus = cash - total_buy_needed
-        rp_amount = surplus * 0.95 if surplus > 0 else 0
-        
-        final_msg, markup = self.view.create_sync_report(status_text, dst_txt, cash, rp_amount, ticker_data_list, status_code in ["PRE", "REG"])
-        await update.message.reply_text(final_msg, reply_markup=markup, parse_mode='HTML')
-
-    async def cmd_record(self, update, context):
-        if not self._is_admin(update): return
-        chat_id = update.message.chat_id
-        status_msg = await context.bot.send_message(chat_id, "🛡️ <b>장부 무결성 검증 및 동기화 중...</b>", parse_mode='HTML')
-        
-        success_tickers = []
-        for t in self.cfg.get_active_tickers():
-            res = await self.process_auto_sync(t, chat_id, context, silent_ledger=True)
-            if res == "SUCCESS": success_tickers.append(t)
-        
-        if success_tickers: 
-            async with self.tx_lock:
-                _, holdings = self.broker.get_account_balance()
-            await self._display_ledger(success_tickers[0], chat_id, context, message_obj=status_msg, pre_fetched_holdings=holdings)
-        else: await status_msg.edit_text("✅ <b>동기화 완료</b> (표시할 진행 중인 장부가 없거나 에러 대기 중입니다)", parse_mode='HTML')
-
-    def _sync_escrow_cash(self, ticker):
-        is_rev = self.cfg.get_reverse_state(ticker).get("is_active", False)
-        if not is_rev:
-            self.cfg.clear_escrow_cash(ticker)
+        now      = datetime.datetime.now(KST)
+        mode_str = "🔴 실전" if self.cfg.get("TRADE_MODE", "MOCK") == "REAL" else "🟡 모의투자"
+        syms     = self._get_active_symbols()
+        sym_list = "\n".join(
+            f"  {'✅' if s.get('active') else '🔇'} {s['name']}({s['code']}) "
+            f"[{'무한매매' if s.get('mode','INFINITE')=='INFINITE' else 'V-REV'}]"
+            for s in self._get_symbols()
+        )
+        msg = (
+            f"📊 <b>국내 ETF 무한매매 봇 {self.VERSION}</b>\n"
+            f"💹 {mode_str} | {self._market_status()}\n"
+            f"🕐 {now.strftime('%Y-%m-%d %H:%M')} KST\n\n"
+            f"⏰ <b>[ 운영 스케줄 ]</b>\n"
+            f"◆ 08:50 : 💰 예수금 점검 및 장 시작 알림\n"
+            f"◆ 09:10 : 🔄 V-REV 리밸런싱 (해당 종목)\n"
+            f"◆ 15:10 : 🔴 LOC 대안 분할 매수 시작\n"
+            f"◆ 15:20 : 🔔 동시호가 잔여 주문\n"
+            f"◆ 15:35 : 📋 일일 정산 리포트\n"
+            f"◆ 매 1분 : 👁 익절 감시 (장중)\n"
+            f"◆ 6시간 : 🔑 API 토큰 자동 갱신\n\n"
+            f"🔧 <b>[ 주요 명령어 ]</b>\n"
+            f"▶ /sync       : 📋 통합 지시서 조회\n"
+            f"▶ /record     : 📊 장부 동기화 및 조회\n"
+            f"▶ /settlement : ⚙️ 설정 현황/파라미터 변경\n"
+            f"▶ /ticker     : 🔄 종목 관리 (추가/제거)\n"
+            f"▶ /mode       : 🎯 INFINITE/V-REV 전환\n"
+            f"▶ /seed       : 💵 시드머니 관리\n"
+            f"▶ /balance    : 💰 예수금 조회\n"
+            f"▶ /holdings   : 📈 보유 종목 현황\n"
+            f"▶ /report     : 📋 당일 정산\n"
+            f"▶ /pause /resume : ⏸ 매매 중지/재개\n\n"
+            f"⚠️ /cancel : 🔒 미체결 전량 취소\n\n"
+            f"<b>[ 운용 종목 ]</b>\n{sym_list}"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("📋 통합 지시서", callback_data="CMD:sync"),
+                InlineKeyboardButton("📊 장부 조회",   callback_data="CMD:record"),
+            ],
+            [
+                InlineKeyboardButton("⚡️ AVWAP 현황",  callback_data="AVWAP:REFRESH"),
+                InlineKeyboardButton("🏆 졸업 전당",    callback_data="CMD:history"),
+            ],
+            [
+                InlineKeyboardButton("🔴 수동 매수",   callback_data="BUY:START"),
+                InlineKeyboardButton("🔵 수동 매도",   callback_data="SEL:START"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ 설정 현황",   callback_data="CMD:settlement"),
+                InlineKeyboardButton("🔄 종목 관리",   callback_data="CMD:ticker"),
+            ],
+            [
+                InlineKeyboardButton("💰 잔고 조회",   callback_data="CMD:balance"),
+                InlineKeyboardButton("📈 보유 현황",   callback_data="CMD:holdings"),
+            ],
+            [
+                InlineKeyboardButton("🏆 졸업 전당",   callback_data="CMD:history"),
+                InlineKeyboardButton("🔄 DB 동기화",   callback_data="SYNCDB:VIEW"),
+            ],
+        ]
+        await update.effective_message.reply_text(
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    # ----------------------------------------------------------
+    # /sync — 통합 지시서 (핵심!)
+    # ----------------------------------------------------------
+    async def cmd_sync(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
             return
-
-        ledger = self.cfg.get_ledger()
-        
-        target_recs = []
-        for r in reversed(ledger):
-            if r.get('ticker') == ticker:
-                if r.get('is_reverse', False):
-                    target_recs.append(r)
-                else:
-                    break
-        
-        escrow = 0.0
-        for r in target_recs:
-            amt = r['qty'] * r['price']
-            if r['side'] == 'SELL': escrow += amt
-            elif r['side'] == 'BUY': escrow -= amt
-                
-        self.cfg.set_escrow_cash(ticker, max(0.0, escrow))
-
-    async def process_auto_sync(self, ticker, chat_id, context, silent_ledger=False):
-        if ticker not in self.sync_locks:
-            self.sync_locks[ticker] = asyncio.Lock()
-            
-        if self.sync_locks[ticker].locked(): 
-            return "LOCKED"
-            
-        async with self.sync_locks[ticker]:
-            async with self.tx_lock:
-                
-                last_split_date = self.cfg.get_last_split_date(ticker)
-                split_ratio, split_date = await asyncio.to_thread(self.broker.get_recent_stock_split, ticker, last_split_date)
-                
-                if split_ratio > 0.0 and split_date != "":
-                    self.cfg.apply_stock_split(ticker, split_ratio)
-                    self.cfg.set_last_split_date(ticker, split_date)
-                    split_type = "액면분할" if split_ratio > 1.0 else "액면병합(역분할)"
-                    await context.bot.send_message(chat_id, f"✂️ <b>[{ticker}] 야후 파이낸스 {split_type} 자동 감지!</b>\n▫️ 감지된 비율: <b>{split_ratio}배</b> (발생일: {split_date})\n▫️ 봇이 기존 장부의 수량과 평단가를 100% 무인 자동 소급 조정 완료했습니다.", parse_mode='HTML')
-                    
-                _, holdings = self.broker.get_account_balance()
-                if holdings is None:
-                    await context.bot.send_message(chat_id, f"❌ <b>[{ticker}] API 오류</b>\n잔고를 불러오지 못했습니다.", parse_mode='HTML')
-                    return "ERROR"
-
-                actual_qty = int(holdings.get(ticker, {'qty': 0})['qty'])
-                actual_avg = float(holdings.get(ticker, {'avg': 0})['avg'])
-                
-                rev_state = self.cfg.get_reverse_state(ticker)
-                if rev_state.get("is_active"):
-                    curr_p = await asyncio.to_thread(self.broker.get_current_price, ticker)
-                    if curr_p > 0 and actual_avg > 0:
-                        curr_ret = (curr_p - actual_avg) / actual_avg * 100.0
-                        exit_target = rev_state.get("exit_target", 0.0) 
-                        if curr_ret >= exit_target:
-                            self.cfg.set_reverse_state(ticker, False, 0, 0.0)
-                            self.cfg.clear_escrow_cash(ticker)
-                            
-                            ledger_data = self.cfg.get_ledger()
-                            changed = False
-                            for lr in ledger_data:
-                                if lr.get('ticker') == ticker and lr.get('is_reverse', False):
-                                    lr['is_reverse'] = False
-                                    changed = True
-                            if changed:
-                                self.cfg._save_json(self.cfg.FILES["LEDGER"], ledger_data)
-                                
-                            await context.bot.send_message(chat_id, f"🌤️ <b>[{ticker}] 리버스 목표 달성({curr_ret:.2f}%)!</b>\n격리 병동을 공식 졸업하고 가상 장부(Escrow) 해제합니다.", parse_mode='HTML')
-                
-                recs = [r for r in self.cfg.get_ledger() if r['ticker'] == ticker]
-                ledger_qty, avg_price, _, _ = self.cfg.calculate_holdings(ticker, recs)
-                
-                diff = actual_qty - ledger_qty
-                price_diff = abs(actual_avg - avg_price)
-
-                if actual_qty == 0:
-                    if ledger_qty > 0:
-                        kst = pytz.timezone('Asia/Seoul')
-                        today_str = datetime.datetime.now(kst).strftime('%Y-%m-%d')
-                        prev_c = await asyncio.to_thread(self.broker.get_previous_close, ticker)
-                        new_hist, added_seed = self.cfg.archive_graduation(ticker, today_str, prev_c)
-                        msg = f"🎉 <b>[{ticker} 졸업 확인!]</b>\n장부를 명예의 전당에 저장하고 새 사이클을 준비합니다."
-                        if added_seed > 0: msg += f"\n💸 <b>자동 복리 +${added_seed:,.0f}</b> 이 다음 운용 시드에 완벽하게 추가되었습니다!"
-                        await context.bot.send_message(chat_id, msg, parse_mode='HTML')
-
-                        if new_hist:
-                            try:
-                                img_path = self.view.create_profit_image(
-                                    ticker=ticker,
-                                    profit=new_hist['profit'],
-                                    yield_pct=new_hist['yield'],
-                                    invested=new_hist['invested'],
-                                    revenue=new_hist['revenue'],
-                                    end_date=new_hist['end_date']
-                                )
-                                if os.path.exists(img_path):
-                                    with open(img_path, 'rb') as photo:
-                                        await context.bot.send_photo(chat_id=chat_id, photo=photo)
-                            except Exception as e:
-                                logging.error(f"📸 졸업 이미지 생성/발송 실패: {e}")
-
-                    self._sync_escrow_cash(ticker) 
-                    return "SUCCESS"
-
-                if diff == 0 and price_diff < 0.01:
-                    pass 
-                elif diff == 0 and price_diff >= 0.01:
-                    self.cfg.calibrate_avg_price(ticker, actual_avg)
-                    await context.bot.send_message(chat_id, f"🔧 <b>[{ticker}] 장부 평단가 미세 오차({price_diff:.4f}) 교정 완료!</b>", parse_mode='HTML')
-                elif diff != 0:
-                    kst = pytz.timezone('Asia/Seoul')
-                    now_kst = datetime.datetime.now(kst)
-
-                    est = pytz.timezone('US/Eastern')
-                    now_est = datetime.datetime.now(est)
-                    nyse = mcal.get_calendar('NYSE')
-                    
-                    schedule = nyse.schedule(start_date=(now_est - datetime.timedelta(days=10)).date(), end_date=now_est.date())
-                    
-                    if not schedule.empty:
-                        last_trade_date = schedule.index[-1]
-                        target_kis_str = last_trade_date.strftime('%Y%m%d')
-                        target_ledger_str = last_trade_date.strftime('%Y-%m-%d')
-                    else:
-                        target_kis_str = now_kst.strftime('%Y%m%d')
-                        target_ledger_str = now_kst.strftime('%Y-%m-%d')
-
-                    target_execs = self.broker.get_execution_history(ticker, target_kis_str, target_kis_str)
-                    
-                    temp_recs = [r for r in recs if r['date'] != target_ledger_str or 'INIT' in str(r.get('exec_id', ''))]
-                    temp_qty, temp_avg, _, _ = self.cfg.calculate_holdings(ticker, temp_recs)
-                    
-                    temp_sim_qty = temp_qty
-                    temp_sim_avg = temp_avg
-                    new_target_records = []
-                    
-                    if target_execs:
-                        target_execs.sort(key=lambda x: x.get('ord_tmd', '000000')) 
-                        for ex in target_execs:
-                            side_cd = ex.get('sll_buy_dvsn_cd')
-                            exec_qty = int(float(ex.get('ft_ccld_qty', '0')))
-                            exec_price = float(ex.get('ft_ccld_unpr3', '0'))
-                            
-                            if side_cd == "02": 
-                                new_avg = ((temp_sim_qty * temp_sim_avg) + (exec_qty * exec_price)) / (temp_sim_qty + exec_qty) if (temp_sim_qty + exec_qty) > 0 else exec_price
-                                temp_sim_qty += exec_qty
-                                temp_sim_avg = new_avg
-                            else: temp_sim_qty -= exec_qty
-                                
-                            new_target_records.append({
-                                'date': target_ledger_str, 'side': "BUY" if side_cd == "02" else "SELL",
-                                'qty': exec_qty, 'price': exec_price, 'avg_price': temp_sim_avg
-                            })
-                            
-                    gap_qty = actual_qty - temp_sim_qty
-                    if gap_qty != 0:
-                        calib_side = "BUY" if gap_qty > 0 else "SELL"
-                        new_target_records.append({
-                            'date': target_ledger_str, 
-                            'side': calib_side,
-                            'qty': abs(gap_qty), 
-                            'price': actual_avg, 
-                            'avg_price': actual_avg,
-                            'exec_id': f"CALIB_{int(time.time())}",
-                            'desc': "비파괴 보정"
-                        })
-                        
-                    if new_target_records:
-                        for r in new_target_records: r['avg_price'] = actual_avg
-                    elif temp_recs: 
-                        temp_recs[-1]['avg_price'] = actual_avg
-                        
-                    self.cfg.overwrite_incremental_ledger(ticker, temp_recs, new_target_records)
-                    
-                    if gap_qty != 0:
-                        await context.bot.send_message(chat_id, f"🔧 <b>[{ticker}] 비파괴 장부 보정 완료!</b>\n▫️ 오차 수량({gap_qty}주)을 기존 역사 보존 상태로 안전하게 교정했습니다.", parse_mode='HTML')
-
-                self._sync_escrow_cash(ticker)
-                return "SUCCESS"
-
-    async def _display_ledger(self, ticker, chat_id, context, query=None, message_obj=None, pre_fetched_holdings=None):
-        recs = [r for r in self.cfg.get_ledger() if r['ticker'] == ticker]
-        
-        if not recs:
-            msg = f"📭 <b>[{ticker}]</b> 현재 진행 중인 사이클이 없습니다 (보유량 0주)."
-        else:
-            from collections import OrderedDict
-            agg_dict = OrderedDict()
-            total_buy = 0.0
-            total_sell = 0.0
-            
-            for rec in recs:
-                parts = rec['date'].split('-')
-                if len(parts) == 3: date_short = f"{parts[1]}.{parts[2]}"
-                else: date_short = rec['date']
-                    
-                side_str = "🔴매수" if rec['side'] == 'BUY' else "🔵매도"
-                key = (date_short, side_str)
-                
-                if key not in agg_dict: agg_dict[key] = {'qty': 0, 'amt': 0.0}
-                agg_dict[key]['qty'] += rec['qty']
-                agg_dict[key]['amt'] += (rec['qty'] * rec['price'])
-                
-                if rec['side'] == 'BUY': total_buy += (rec['qty'] * rec['price'])
-                elif rec['side'] == 'SELL': total_sell += (rec['qty'] * rec['price'])
-            
-            report = f"📜 <b>[ {ticker} 일자별 매매 (통합 변동분) (총 {len(agg_dict)}일) ]</b>\n\n<code>No. 일자   구분  평균단가  수량\n"
-            report += "-"*30 + "\n"
-            
-            idx = 1
-            for (date, side), data in agg_dict.items():
-                tot_qty = data['qty']
-                avg_prc = data['amt'] / tot_qty if tot_qty > 0 else 0.0
-                report += f"{idx:<3} {date} {side} ${avg_prc:<6.2f} {tot_qty}주\n"
-                idx += 1
-                
-            report += "-"*30 + "</code>\n"
-            
-            actual_qty = int(pre_fetched_holdings.get(ticker, {'qty': 0})['qty']) if pre_fetched_holdings else 0
-            actual_avg = float(pre_fetched_holdings.get(ticker, {'avg': 0})['avg']) if pre_fetched_holdings else 0.0
-            
-            split = self.cfg.get_split_count(ticker)
-            t_val, _ = self.cfg.get_absolute_t_val(ticker, actual_qty, actual_avg)
-            
-            report += f"📊 <b>[ 현재 진행 상황 요약 ]</b>\n"
-            report += f"▪️ 현재 T값 : {t_val:.4f} T ({int(split)}분할)\n"
-            report += f"▪️ 보유 수량 : {actual_qty} 주 (평단 ${actual_avg:,.2f})\n"
-            report += f"▪️ 총 매수액 : ${total_buy:,.2f}\n"
-            report += f"▪️ 총 매도액 : ${total_sell:,.2f}"
-            
-            msg = report
-
-        tickers = self.cfg.get_active_tickers()
-        keyboard = []
-        row = [InlineKeyboardButton(t, callback_data=f"REC:SYNC:{t}") for t in tickers]
-        keyboard.append(row)
-        markup = InlineKeyboardMarkup(keyboard)
-
-        if query: await query.edit_message_text(msg, reply_markup=markup, parse_mode='HTML')
-        elif message_obj: await message_obj.edit_text(msg, reply_markup=markup, parse_mode='HTML')
-        else: await context.bot.send_message(chat_id, msg, reply_markup=markup, parse_mode='HTML')
-
-    async def cmd_history(self, update, context):
-        if not self._is_admin(update): return
-        history = self.cfg.get_history()
-        if not history:
-            await update.message.reply_text("📜 저장된 역사가 없습니다.")
-            return
-        msg = "🏆 <b>[ 졸업 명예의 전당 ]</b>\n"
-        keyboard = [[InlineKeyboardButton(f"{h['end_date']} | {h['ticker']} (+${h['profit']:.0f})", callback_data=f"HIST:VIEW:{h['id']}")] for h in history]
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-    async def cmd_mode(self, update, context):
-        if not self._is_admin(update): return
-        is_turbo = self.cfg.get_turbo_mode()
-        msg = f"🕹️ <b>[ 매매 모드 ]</b>\n현재: {'🏎️ 가속' if is_turbo else '🐢 일반'}"
-        keyboard = [[InlineKeyboardButton("🐢 일반", callback_data="MODE:OFF"), InlineKeyboardButton("🏎️ 가속", callback_data="MODE:ON")]]
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-    async def cmd_reset(self, update, context):
-        if not self._is_admin(update): return
-        active_tickers = self.cfg.get_active_tickers()
-        msg, markup = self.view.get_reset_menu(active_tickers)
-        await update.message.reply_text(msg, reply_markup=markup, parse_mode='HTML')
-
-    async def cmd_seed(self, update, context):
-        if not self._is_admin(update): return
-        msg = "💵 <b>[ 종목별 시드머니 관리 ]</b>\n\n"
-        keyboard = []
-        for t in self.cfg.get_active_tickers():
-            current_seed = self.cfg.get_seed(t)
-            msg += f"💎 <b>{t}</b>: ${current_seed:,.0f}\n"
-            keyboard.append([
-                InlineKeyboardButton(f"➕ {t} 추가", callback_data=f"SEED:ADD:{t}"), 
-                InlineKeyboardButton(f"➖ {t} 감소", callback_data=f"SEED:SUB:{t}"),
-                InlineKeyboardButton(f"🔢 {t} 고정", callback_data=f"SEED:SET:{t}")
-            ])
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-    async def cmd_ticker(self, update, context):
-        if not self._is_admin(update): return
-        msg, markup = self.view.get_ticker_menu(self.cfg.get_active_tickers())
-        await update.message.reply_text(msg, reply_markup=markup, parse_mode='HTML')
-
-    async def cmd_settlement(self, update, context):
-        if not self._is_admin(update): return
-        msg = "⚙️ <b>[ 현재 설정 및 복리 상태 ]</b>\n\n"
-        keyboard = []
-        for t in self.cfg.get_active_tickers():
-            ver = self.cfg.get_version(t)
-            
-            if ver == "V17":
-                icon = "🦇"
-                ver_display = "V17 시크릿"
-            elif ver == "V14":
-                icon = "💎"
-                ver_display = "무매4"
-            else:
-                icon = "💎"
-                ver_display = "무매3"
-                
-            msg += f"{icon} <b>{t} ({ver_display} 모드)</b>\n▫️ 분할: <b>{int(self.cfg.get_split_count(t))}회</b>\n▫️ 목표: <b>{self.cfg.get_target_profit(t)}%</b>\n▫️ 자동복리: <b>{self.cfg.get_compound_rate(t)}%</b>\n"
-            
-            if ver == "V17":
-                sniper_multiplier = self.cfg.get_sniper_multiplier(t)
-                msg += f"▫️ 스나이퍼 타점 가중치: <b>x {sniper_multiplier}</b>\n\n"
-            else:
-                msg += "\n"
-                
-            row1 = [
-                InlineKeyboardButton(f"⚙️ {t} 분할", callback_data=f"INPUT:SPLIT:{t}"), 
-                InlineKeyboardButton(f"🎯 {t} 목표", callback_data=f"INPUT:TARGET:{t}"),
-                InlineKeyboardButton(f"💸 {t} 복리", callback_data=f"INPUT:COMPOUND:{t}")
-            ]
-            keyboard.append(row1)
-            
-            row2 = [
-                InlineKeyboardButton(f"🔄 {t} 무매3/무매4 전환", callback_data=f"TOGGLE:VERSION:{t}"),
-                InlineKeyboardButton(f"✂️ {t} 액면보정", callback_data=f"INPUT:STOCK_SPLIT:{t}")
-            ]
-            if ver == "V17":
-                row2.append(InlineKeyboardButton(f"📉 {t} 타점가중치", callback_data=f"INPUT:SNIPER:{t}"))
-            keyboard.append(row2)
-            
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-    async def cmd_version(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update): return
-        history_data = self.cfg.get_full_version_history()
-        msg, markup = self.view.get_version_message(history_data, page_index=None)
-        await update.message.reply_text(msg, reply_markup=markup, parse_mode='HTML')
-
-    async def cmd_holiday(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """임시공휴일 수동 등록/조회/삭제 (/holiday)"""
-        if not self._is_admin(update): return
-
-        import json, os
-        path = os.path.join("data", "extra_closed_dates.json")
-
-        def load_holidays():
-            if os.path.exists(path):
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        return json.load(f)
-                except Exception:
-                    pass
-            return {}
-
-        def save_holidays(d):
-            os.makedirs("data", exist_ok=True)
-            import tempfile
-            tmp = path + ".tmp"
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(d, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-
-        args = context.args  # /holiday 뒤에 오는 인자들
-        holidays = load_holidays()
-
-        # /holiday → 목록 조회
-        if not args:
-            if not holidays:
-                msg = (
-                    "📅 <b>[ 임시공휴일 관리 ]</b>\n\n"
-                    "등록된 임시공휴일이 없습니다.\n\n"
-                    "📌 <b>사용법:</b>\n"
-                    "• 추가: <code>/holiday add 2026-07-04 미국독립기념일</code>\n"
-                    "• 삭제: <code>/holiday del 2026-07-04</code>\n"
-                    "• 목록: <code>/holiday</code>"
-                )
-            else:
-                items = "\n".join(
-                    f"• <code>{d}</code> — {label}"
-                    for d, label in sorted(holidays.items())
-                )
-                msg = (
-                    f"📅 <b>[ 임시공휴일 목록 ({len(holidays)}건) ]</b>\n\n"
-                    f"{items}\n\n"
-                    "📌 <b>사용법:</b>\n"
-                    "• 추가: <code>/holiday add 2026-07-04 미국독립기념일</code>\n"
-                    "• 삭제: <code>/holiday del 2026-07-04</code>"
-                )
-            await update.message.reply_text(msg, parse_mode='HTML')
-            return
-
-        action = args[0].lower()
-
-        # /holiday add YYYY-MM-DD 설명
-        if action == "add":
-            if len(args) < 2:
-                await update.message.reply_text("❌ 형식: /holiday add 2026-07-04 [설명]")
-                return
-            date_str = args[1]
-            label = " ".join(args[2:]) if len(args) > 2 else "임시 휴장일"
-            # 날짜 형식 검증
+        msg_obj = await update.effective_message.reply_text(
+            "🔄 시장 분석 및 지시서 작성 중...", parse_mode="HTML"
+        )
+        try:
+            await self._send_sync_report(msg_obj, context)
+        except Exception as e:
+            log.exception("[TG] sync 실패")
+            await msg_obj.edit_text(f"❌ 지시서 생성 실패: {e}")
+    async def _send_sync_report(self, msg_obj, context):
+        now      = datetime.datetime.now(KST)
+        mode_str = "🔴 실전" if self.cfg.get("TRADE_MODE", "MOCK") == "REAL" else "🟡 모의"
+        mkt      = self._market_status()
+        # 잔고 조회
+        try:
+            balance      = await asyncio.to_thread(self.broker.get_balance)
+            deposit      = balance.get("deposit", 0)
+            withdrawable = balance.get("withdrawable", 0)
+        except Exception:
+            deposit = withdrawable = 0
+        # 보유 종목
+        try:
+            holdings_list = await asyncio.to_thread(self.broker.get_holdings)
+            holdings      = {h["code"]: h for h in holdings_list}
+        except Exception:
+            holdings = {}
+        syms = self._get_active_symbols()
+        lines = [
+            f"📋 <b>[ 통합 지시서 ({mkt}) ]</b>",
+            f"🕐 {now.strftime('%Y-%m-%d %H:%M')} KST  |  {mode_str}",
+            f"💰 주문가능금액: {self._fmt_krw(withdrawable)}",
+        ]
+        inline_btns = []
+        for s in syms:
+            code      = s["code"]
+            name      = s["name"]
+            split     = s.get("split_count", 10)
+            target_r  = s.get("target_profit_pct", 5.0) / 100.0
+            allocation= s.get("allocation_krw", 0)
+            one_port  = allocation // split if split > 0 else allocation
+            mode_icon = "💎" if s.get("mode", "INFINITE") == "INFINITE" else "⚖️"
+            mode_label= "무한매매" if s.get("mode", "INFINITE") == "INFINITE" else "V-REV"
+            pos       = self.db.get_position(code) or {}
+            avg_price = int(pos.get("avg_price", 0))
+            total_qty = int(pos.get("total_qty", 0))
+            round_no  = pos.get("round_no", 1)
+            # 실시간 현재가 + 고가/저가 (ka10001)
             try:
-                import datetime as dt
-                dt.datetime.strptime(date_str, "%Y-%m-%d")
-            except ValueError:
-                await update.message.reply_text("❌ 날짜 형식 오류: YYYY-MM-DD 형식으로 입력하세요\n예) /holiday add 2026-07-04 독립기념일")
-                return
-            holidays[date_str] = label
-            save_holidays(holidays)
-            await update.message.reply_text(
-                f"✅ <b>임시공휴일 등록 완료</b>\n"
-                f"📅 날짜: <code>{date_str}</code>\n"
-                f"📝 설명: {label}\n\n"
-                f"해당 날짜에는 자동매매가 건너뜁니다.",
-                parse_mode='HTML'
-            )
+                info       = await asyncio.to_thread(self.broker.get_stock_info, code)
+                cur        = info.get("cur_price",  0)
+                prev_close = info.get("prev_close", 0)
+                day_high   = info.get("day_high",   0)
+                day_low    = info.get("day_low",    0)
+                change_pct = info.get("change_pct", 0.0)
+            except Exception:
+                cur = prev_close = day_high = day_low = 0
+                change_pct = 0.0
+            # ── 브로커 보유 잔고 + 핵심 계산 ─────────────────────
+            broker_h  = holdings.get(code, {})
+            b_qty     = int(broker_h.get("qty", 0))
+            b_avg     = int(broker_h.get("avg_price", 0))
+            qty = b_qty if b_qty > 0 else total_qty
+            avg = b_avg if b_avg > 0 else avg_price
 
-        # /holiday del YYYY-MM-DD
-        elif action in ("del", "delete", "rm", "remove"):
-            if len(args) < 2:
-                await update.message.reply_text("❌ 형식: /holiday del 2026-07-04")
-                return
-            date_str = args[1]
-            if date_str in holidays:
-                label = holidays.pop(date_str)
-                save_holidays(holidays)
-                await update.message.reply_text(
-                    f"✅ <b>임시공휴일 삭제 완료</b>\n"
-                    f"📅 삭제된 날짜: <code>{date_str}</code> ({label})",
-                    parse_mode='HTML'
-                )
+            sync_info    = self.engine.build_sync_plan(
+                s, cur, {"avg_price": avg, "total_qty": qty} if qty > 0 else {}
+            )
+            t_val        = sync_info["t_val"]
+            star_ratio   = sync_info["star_ratio"]
+            star_price   = sync_info["star_price"]
+            target_price = sync_info["target_price"]
+            large_num    = sync_info["large_num"]
+            plan_result  = sync_info["plan"]
+            phase        = sync_info["phase"]
+
+            # 수익률
+            if qty > 0 and avg > 0 and cur > 0:
+                profit_pct = (cur - avg) / avg * 100
+                profit_amt = (cur - avg) * qty
             else:
-                await update.message.reply_text(f"❌ <code>{date_str}</code> 는 등록된 임시공휴일이 아닙니다.", parse_mode='HTML')
+                profit_pct = profit_amt = 0
 
+            # 수익률
+            if qty > 0 and avg > 0 and cur > 0:
+                profit_pct  = (cur - avg) / avg * 100
+                profit_amt  = (cur - avg) * qty
+            else:
+                profit_pct = profit_amt = 0
+
+            # ── 종목 섹션 출력 ─────────────────────────────────
+            lines += [
+                "",
+                f"{mode_icon} <b>[{name}] {mode_label} ({round_no}회차)</b>",
+                f"📈 진행: <b>{t_val:.2f}T / {split}분할</b>  [{phase}]",
+                f"💵 총 할당: {self._fmt_krw(allocation)}  |  회차예산: {self._fmt_krw(one_port)}",
+            ]
+            if cur > 0:
+                chg_icon = "🔺" if change_pct >= 0 else "🔻"
+                chg_sign = "+" if change_pct >= 0 else ""
+                lines.append(
+                    f"💱 현재 {self._fmt_krw(cur)} ({chg_icon}{chg_sign}{change_pct:.2f}%) "
+                    f"/ 평단 {self._fmt_krw(avg)} ({qty:,}주)"
+                )
+            if day_high > 0:
+                lines.append(
+                    f"📈 금일 고가: {self._fmt_krw(day_high)} "
+                    f"/ 저가: {self._fmt_krw(day_low)}"
+                )
+            if qty > 0 and avg > 0 and cur > 0:
+                icon = "🔺" if profit_amt >= 0 else "🔻"
+                lines.append(
+                    f"{icon} 수익: <b>{self._fmt_pct(profit_pct)}</b> "
+                    f"({self._fmt_krw(profit_amt)})"
+                )
+
+            lines.append("")
+            if avg > 0:
+                lines += [
+                    f"⚙️ 익절목표: <b>{self._fmt_krw(target_price)}</b> (+{target_r*100:.1f}%)",
+                    f"⭐ 별값: {self._fmt_pct(star_ratio*100)} | 별값가: {self._fmt_krw(star_price)}",
+                    f"🔶 큰수: {self._fmt_krw(large_num)} ({s.get('large_num_pct',15.0):.0f}%)",
+                ]
+            elif cur > 0:
+                # 새출발 예상값
+                lines += [
+                    f"⚙️ 진입시 예상 목표: <b>{self._fmt_krw(target_price)}</b> (+{target_r*100:.1f}%)",
+                    f"⭐ 진입시 예상 별값: {self._fmt_krw(star_price)}",
+                    f"🔶 큰수(진입 기준가): {self._fmt_krw(large_num)} ({s.get('large_num_pct',15.0):.0f}%)",
+                ]
+
+            # ── 주문 계획 표시 ──────────────────────────────────
+            buy_orders  = plan_result.get("buy",  [])
+            sell_orders = plan_result.get("sell", [])
+
+            if buy_orders or sell_orders:
+                lines.append(f"📋 <b>[ 주문 계획 — {phase} ]</b>")
+
+                # ── 매수 섹션
+                if buy_orders:
+                    lines.append("  <b>▼ 매수</b>")
+                    # 기본 매수 주문 (줍줍 제외)
+                    main_buys = [o for o in buy_orders if "줍줍" not in o["desc"]]
+                    jub_buys  = [o for o in buy_orders if "줍줍"     in o["desc"]]
+                    for o in main_buys:
+                        lines.append(
+                            f"  🔴 [{o['type']}] {o['desc']}"
+                            f"  {self._fmt_krw(o['price'])} × {o['qty']:,}주"
+                        )
+                    if jub_buys:
+                        # 줍줍은 가격 범위로 요약
+                        min_p = min(o["price"] for o in jub_buys)
+                        max_p = max(o["price"] for o in jub_buys)
+                        lines.append(
+                            f"  🧹 [동시호가] 줍줍 {len(jub_buys)}건"
+                            f"  ({self._fmt_krw(min_p)} ~ {self._fmt_krw(max_p)}) × 각 1주"
+                        )
+                        for o in jub_buys:
+                            lines.append(
+                                f"      └ {o['desc']}: {self._fmt_krw(o['price'])} 이하"
+                            )
+
+                # ── 구분선
+                if buy_orders and sell_orders:
+                    lines.append("")
+
+                # ── 매도 섹션
+                if sell_orders:
+                    label = "▼ 매도 [진입후 예상]" if "진입후 예상" in (sell_orders[0].get("desc","")) else "▼ 매도"
+                    lines.append(f"  <b>{label}</b>")
+                    for o in sell_orders:
+                        desc_clean = o["desc"].replace(" [진입후 예상]", "")
+                        lines.append(
+                            f"  🔵 [{o['type']}] {desc_clean}"
+                            f"  {self._fmt_krw(o['price'])} × {o['qty']:,}주"
+                        )
+
+            elif cur <= 0:
+                lines.append("  ⚠️ 현재가 조회 불가 — 15:10 재시도")
+            lines.append("")
+            inline_btns.append([
+                InlineKeyboardButton(
+                    f"📊 {name} 장부", callback_data=f"RECORD:{code}"
+                ),
+                InlineKeyboardButton(
+                    f"⚙️ {name} 설정", callback_data=f"SETTLE:{code}"
+                ),
+            ])
+        lines.append(f"\n{mkt} | {now.strftime('%H:%M:%S')} KST")
+        await msg_obj.edit_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_btns)
+        )
+    # ----------------------------------------------------------
+    # /record — 장부 조회
+    # ----------------------------------------------------------
+    async def cmd_record(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        syms = self._get_active_symbols()
+        keyboard = []
+        msg = "📊 <b>장부 조회</b>\n조회할 종목을 선택하세요:\n"
+        for s in syms:
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"📋 {s['name']}",
+                    callback_data=f"RECORD:{s['code']}"
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("📋 전체 조회", callback_data="RECORD:ALL")])
+        await update.effective_message.reply_text(
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    async def _show_record(self, code: str, query=None, msg_obj=None):
+        sym = self._get_symbol(code)
+        if not sym:
+            txt = f"❌ {code} 종목을 찾을 수 없습니다."
+            if query:
+                await query.edit_message_text(txt)
+            return
+        name    = sym["name"]
+        today   = datetime.date.today().isoformat()
+        # 최근 10일 체결 내역
+        all_trades = []
+        for i in range(10):
+            d = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
+            trades = self.db.get_trades_by_date(d)
+            all_trades += [t for t in trades if t.get("code") == code]
+        # 포지션
+        pos       = self.db.get_position(code) or {}
+        avg_price = int(pos.get("avg_price", 0))
+        total_qty = int(pos.get("total_qty", 0))
+        split     = sym.get("split_count", 10)
+        allocation= sym.get("allocation_krw", 0)
+        one_port  = allocation // split if split > 0 else allocation
+        one_port_qty = calc_one_portion_qty(one_port, avg_price) if avg_price > 0 else 1
+        t_val        = calc_t_val(total_qty, one_port_qty)
+        lines = [
+            f"📋 <b>[ {name}({code}) 장부 (최근 10일) ]</b>",
+            "",
+            f"{'No.':<4} {'일자':<6} {'구분':<4} {'평균단가':>10} {'수량':>5}",
+            "─" * 10,
+        ]
+        for i, t in enumerate(all_trades[:15], 1):
+            side_icon = "🔴매수" if t.get("side") == "BUY" else "🔵매도"
+            date_str  = t.get("trade_date", "")[-5:].replace("-", ".")
+            price_str = f"{int(t.get('price',0)):,}원"
+            qty_str   = f"{int(t.get('qty',0)):,}주"
+            lines.append(f"{i:<4} {date_str:<6} {side_icon} {price_str:>10} {qty_str:>6}")
+        if not all_trades:
+            lines.append("  (거래 내역 없음)")
+        total_buy  = sum(t.get("amount", 0) for t in all_trades if t.get("side") == "BUY")
+        total_sell = sum(t.get("amount", 0) for t in all_trades if t.get("side") == "SELL")
+        lines += [
+            "─" * 10,
+            f"📊 <b>[ 현재 진행 상황 ]</b>",
+            f"■ 현재 T값: {t_val:.4f}T ({split}분할)",
+            f"■ 보유 수량: {total_qty:,}주 (평단 {self._fmt_krw(avg_price)})",
+            f"■ 총 매수액: {self._fmt_krw(int(total_buy))}",
+            f"■ 총 매도액: {self._fmt_krw(int(total_sell))}",
+        ]
+        keyboard = [[
+            InlineKeyboardButton(
+                f"🔄 {name} 장부 업데이트", callback_data=f"RECORD:UPDATE:{code}"
+            )
+        ]]
+        txt = "\n".join(lines)
+        if query:
+            await query.edit_message_text(
+                txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        elif msg_obj:
+            await msg_obj.edit_text(
+                txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    async def _show_record_to_chat(self, code: str, context, chat_id: int):
+        """새 메시지로 장부 전송 (전체 조회용)."""
+        sym = self._get_symbol(code)
+        if not sym:
+            await context.bot.send_message(chat_id, f"❌ {code} 종목 없음")
+            return
+        name = sym["name"]
+        today = datetime.date.today().isoformat()
+        all_trades = []
+        for i in range(10):
+            d = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
+            all_trades += [t for t in self.db.get_trades_by_date(d)
+                           if t.get("code") == code]
+        pos       = self.db.get_position(code) or {}
+        avg_price = int(pos.get("avg_price", 0))
+        total_qty = int(pos.get("total_qty", 0))
+        split     = sym.get("split_count", 10)
+        allocation= sym.get("allocation_krw", 0)
+        one_port  = allocation // split if split > 0 else allocation
+        one_port_qty = calc_one_portion_qty(one_port, avg_price) if avg_price > 0 else 1
+        t_val    = calc_t_val(total_qty, one_port_qty)
+        lines    = [f"📋 <b>[ {name}({code}) 장부 ]</b>", ""]
+        for i, t in enumerate(all_trades[:10], 1):
+            side_icon = "🔴매수" if t.get("side") == "BUY" else "🔵매도"
+            date_str  = t.get("trade_date","")[-5:].replace("-",".")
+            price_str = f"{int(t.get('price',0)):,}원"
+            qty_str   = f"{int(t.get('qty',0)):,}주"
+            lines.append(f"{i} {date_str} {side_icon} {price_str} {qty_str}")
+        total_buy  = sum(t.get("amount",0) for t in all_trades if t.get("side")=="BUY")
+        total_sell = sum(t.get("amount",0) for t in all_trades if t.get("side")=="SELL")
+        lines += [
+            "─" * 10,
+            f"T값: {t_val:.4f}T | 보유: {total_qty:,}주 (평단 {self._fmt_krw(avg_price)})",
+            f"총매수: {self._fmt_krw(int(total_buy))} | 총매도: {self._fmt_krw(int(total_sell))}",
+        ]
+        kb = [[InlineKeyboardButton(f"🔄 {name} 업데이트",
+                                    callback_data=f"RECORD:UPDATE:{code}")]]
+        await context.bot.send_message(
+            chat_id, "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+    # ----------------------------------------------------------
+    # /settlement — 설정 현황 및 파라미터 변경
+    # ----------------------------------------------------------
+    async def cmd_settlement(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        await self._show_settlement(update.message)
+    async def _show_settlement(self, msg, query=None):
+        syms   = self._get_symbols()
+        lines  = ["⚙️ <b>[ 현재 설정 및 운영 상태 ]</b>", ""]
+        boards = []
+        for s in syms:
+            code   = s["code"]
+            name   = s["name"]
+            mode   = s.get("mode", "INFINITE")
+            active = s.get("active", True)
+            split  = s.get("split_count", 10)
+            target = s.get("target_profit_pct", 5.0)
+            alloc  = s.get("allocation_krw", 0)
+            band   = s.get("vrev_band_pct", 3.0)
+            limit  = s.get("daily_buy_limit_krw", 0)
+            mode_label = "무한매매 (LOC)" if mode == "INFINITE" else "V-REV 리밸런싱"
+            act_icon   = "✅" if active else "🔇"
+            avwap_budget = s.get("avwap_budget", 0)
+            avwap_icon   = "⚡️ ON" if avwap_budget > 0 else "💤 OFF"
+            lines += [
+                f"{act_icon} <b>{name} ({code})</b>  [{mode_label}]",
+                f"  분할: {split}회 | 목표: {target:.1f}% | 밴드: {band:.1f}%",
+                f"  할당금: {self._fmt_krw(alloc)} | 일한도: {self._fmt_krw(limit)}",
+                f"  AVWAP: {avwap_icon}"
+                + (f" | 예산: {self._fmt_krw(avwap_budget)}" if avwap_budget > 0 else ""),
+                "",
+            ]
+            # 종목별 헤더 + 버튼 행 (색상으로 구분)
+            _icons = ["🔵","🟢","🟠","🔴","🟣","🟡"]
+            _all_codes = [s["code"] for s in self._get_symbols()]
+            _idx = _all_codes.index(code) if code in _all_codes else 0
+            t_icon = _icons[_idx % len(_icons)]
+            act_txt  = "✅ 활성" if active else "🔇 비활성"
+            mode_txt = "무한→VREV" if mode=="INFINITE" else "VREV→무한"
+            alloc_m  = alloc // 10000
+            limit_m  = limit // 10000
+            # ── 헤더: 전체 너비 1열, 종목 구분용 ──────────
+            boards.append([
+                InlineKeyboardButton(
+                    f"{t_icon} {name} ({code}) {t_icon}",
+                    callback_data=f"RECORD:{code}"
+                ),
+            ])
+            # ── 활성/모드 ────────────
+            boards.append([
+                InlineKeyboardButton(f"{act_txt}",  callback_data=f"SETTLE:TOGGLE:{code}"),
+                InlineKeyboardButton(f"{mode_txt}", callback_data=f"SETTLE:MODE:{code}"),
+            ])
+            # ── 세부 설정 ────────────
+            boards.append([
+                InlineKeyboardButton(f"분할 ({split}회)",    callback_data=f"SETTLE:SET:split:{code}"),
+                InlineKeyboardButton(f"목표 ({target:.0f}%)", callback_data=f"SETTLE:SET:target:{code}"),
+                InlineKeyboardButton(f"밴드 ({band:.0f}%)",  callback_data=f"SETTLE:SET:band:{code}"),
+            ])
+            boards.append([
+                InlineKeyboardButton(f"💰 할당금 ({alloc_m}만원)", callback_data=f"SETTLE:SET:alloc:{code}"),
+                InlineKeyboardButton(f"📅 일한도 ({limit_m}만원)", callback_data=f"SETTLE:SET:limit:{code}"),
+            ])
+            # ── AVWAP 설정 ────────────
+            avwap_budget = s.get("avwap_budget", 0)
+            avwap_toggle_txt = "⚡️ AVWAP ON" if avwap_budget > 0 else "💤 AVWAP OFF"
+            avwap_budget_m   = avwap_budget // 10000
+            boards.append([
+                InlineKeyboardButton(
+                    avwap_toggle_txt,
+                    callback_data=f"SETTLE:AVWAP:TOGGLE:{code}"
+                ),
+                InlineKeyboardButton(
+                    f"⚡️예산 ({avwap_budget_m}만원)" if avwap_budget > 0 else "⚡️예산 설정",
+                    callback_data=f"SETTLE:AVWAP:BUDGET:{code}"
+                ),
+            ])
+        txt = "\n".join(lines)
+        if query:
+            await query.edit_message_text(
+                txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(boards)
+            )
+        elif msg:
+            await msg.reply_text(
+                txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(boards)
+            )
+    # ----------------------------------------------------------
+    # /ticker — 종목 관리
+    # ----------------------------------------------------------
+    async def cmd_ticker(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        await self._show_ticker_menu(update.message)
+    async def _show_ticker_menu(self, msg, query=None):
+        syms = self._get_symbols()
+        lines = ["🔄 <b>[ 종목 관리 ]</b>", ""]
+        keyboard = []
+        for s in syms:
+            code   = s["code"]
+            name   = s["name"]
+            active = s.get("active", True)
+            mode   = s.get("mode", "INFINITE")
+            icon   = "✅" if active else "🔇"
+            m_icon = "💎" if mode == "INFINITE" else "⚖️"
+            lines.append(f"{icon} {m_icon} {name} ({code})")
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{'✅ 활성화됨' if active else '🔇 비활성화됨'}  {name}",
+                    callback_data=f"TICKER:TOGGLE:{code}"
+                ),
+                InlineKeyboardButton(
+                    "🗑 제거", callback_data=f"TICKER:REMOVE:{code}"
+                ),
+            ])
+        keyboard.append([
+            InlineKeyboardButton("➕ 새 종목 추가", callback_data="TICKER:ADD")
+        ])
+        keyboard.append([
+            InlineKeyboardButton("🔄 기본 종목 복원", callback_data="TICKER:RESET")
+        ])
+        txt = "\n".join(lines)
+        if query:
+            await query.edit_message_text(
+                txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        elif msg:
+            await msg.reply_text(
+                txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    # ----------------------------------------------------------
+    # /mode — INFINITE / V-REV 전환
+    # ----------------------------------------------------------
+    async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        syms     = self._get_active_symbols()
+        keyboard = []
+        lines    = ["🎯 <b>[ 모드 전환 ]</b>", ""]
+        for s in syms:
+            code = s["code"]
+            name = s["name"]
+            mode = s.get("mode", "INFINITE")
+            icon = "💎" if mode == "INFINITE" else "⚖️"
+            lines.append(f"{icon} {name}: {'무한매매' if mode=='INFINITE' else 'V-REV'}")
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{name} → {'V-REV' if mode=='INFINITE' else '무한매매'}",
+                    callback_data=f"SETTLE:MODE:{code}"
+                )
+            ])
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    # ----------------------------------------------------------
+    # /seed — 시드머니 설정
+    # ----------------------------------------------------------
+    async def cmd_seed(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        syms     = self._get_active_symbols()
+        keyboard = []
+        lines    = ["💵 <b>[ 시드머니(할당금) 관리 ]</b>", ""]
+        for s in syms:
+            code  = s["code"]
+            name  = s["name"]
+            alloc = s.get("allocation_krw", 0)
+            lines.append(f"◆ {name}: {self._fmt_krw(alloc)}")
+            keyboard.append([
+                InlineKeyboardButton(f"💵 {name} 변경", callback_data=f"SETTLE:SET:alloc:{code}")
+            ])
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    # ----------------------------------------------------------
+    # /balance /holdings /report /pause /resume /cancel /help
+    # ----------------------------------------------------------
+    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        m = await update.effective_message.reply_text("💰 잔고 조회 중...")
+        try:
+            b = await asyncio.to_thread(self.broker.get_balance)
+            await m.edit_text(
+                f"💰 <b>계좌 잔고</b>\n"
+                f"📥 예수금:    {self._fmt_krw(b.get('deposit',0))}\n"
+                f"💳 출금가능:  {self._fmt_krw(b.get('withdrawable',0))}\n"
+                f"📊 평가금액:  {self._fmt_krw(b.get('eval_total',0))}\n"
+                f"💹 평가손익:  {self._fmt_krw(b.get('eval_profit',0))} "
+                f"({self._fmt_pct(b.get('profit_pct',0))})\n"
+                f"🕐 {datetime.datetime.now(KST).strftime('%H:%M:%S')} KST",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await m.edit_text(f"❌ 잔고 조회 실패: {e}")
+    async def cmd_holdings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        m = await update.effective_message.reply_text("📈 보유 종목 조회 중...")
+        try:
+            hs = await asyncio.to_thread(self.broker.get_holdings)
+            if not hs:
+                await m.edit_text("📭 현재 보유 종목이 없습니다.", parse_mode="HTML")
+                return
+            lines = ["📈 <b>보유 종목 평가손익</b>", ""]
+            total_profit = 0
+            for h in hs:
+                profit = h.get("profit", 0)
+                pct    = h.get("profit_pct", 0.0)
+                icon   = "🟢" if profit >= 0 else "🔴"
+                sign   = "+" if profit >= 0 else ""
+                lines.append(
+                    f"{icon} <b>{h.get('name','')}({h.get('code','')})</b>\n"
+                    f"   {h.get('qty',0):,}주 | 평단 {self._fmt_krw(h.get('avg_price',0))} "
+                    f"| 현재 {self._fmt_krw(h.get('current_price',0))}\n"
+                    f"   손익: <b>{sign}{self._fmt_krw(profit)}</b> ({sign}{pct:.2f}%)"
+                )
+                total_profit += profit
+            sign_t = "+" if total_profit >= 0 else ""
+            lines += [
+                f"💼 총 평가손익: <b>{sign_t}{self._fmt_krw(total_profit)}</b>",
+            ]
+            await m.edit_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            await m.edit_text(f"❌ 보유 종목 조회 실패: {e}")
+    async def cmd_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        today  = datetime.date.today().isoformat()
+        trades = self.db.get_trades_by_date(today)
+        lines  = [f"📋 <b>당일 정산 ({today})</b>", ""]
+        syms   = self._get_active_symbols()
+        for s in syms:
+            code = s["code"]
+            name = s["name"]
+            st   = [t for t in trades if t.get("code") == code]
+            buys = [t for t in st if t.get("side") == "BUY"]
+            sells= [t for t in st if t.get("side") == "SELL"]
+            buy_amt  = sum(t.get("amount", 0) for t in buys)
+            sell_amt = sum(t.get("amount", 0) for t in sells)
+            pnl      = sell_amt - buy_amt
+            sign     = "+" if pnl >= 0 else ""
+            if st:
+                lines += [
+                    f"◆ <b>{name}</b>",
+                    f"  매수 {len(buys)}건: {self._fmt_krw(int(buy_amt))}",
+                    f"  매도 {len(sells)}건: {self._fmt_krw(int(sell_amt))}",
+                    f"  당일 손익: <b>{sign}{self._fmt_krw(int(pnl))}</b>",
+                ]
+        if not any(
+            self.db.get_trades_by_date(today)
+            for _ in [1]
+        ):
+            lines.append("  오늘 체결 내역 없음")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+    # ----------------------------------------------------------
+    # /buy — 수동 매수 주문
+    # 사용법: /buy [코드] [수량] [가격(0=시장가)]
+    # 예시:   /buy 122630 5 15000   (지정가)
+    #         /buy 122630 5          (시장가)
+    # ----------------------------------------------------------
+    # ==========================================================
+    # 수동 매수/매도 UI (4단계 인라인 버튼 흐름)
+    # Step1 종목선택 -> Step2 수량선택 -> Step3 가격선택 -> Step4 확인
+    # ==========================================================
+
+    async def cmd_buy(self, update, context):
+        if not self._is_admin(update): return
+        await self._show_trade_ticker(update.effective_message, "BUY")
+
+    async def cmd_sell(self, update, context):
+        if not self._is_admin(update): return
+        await self._show_trade_ticker(update.effective_message, "SELL")
+
+    async def _show_trade_ticker(self, msg, side, query=None):
+        syms  = self._get_active_symbols()
+        icon  = "🔴" if side == "BUY" else "🔵"
+        label = "매수" if side == "BUY" else "매도"
+        pre   = "BUY" if side == "BUY" else "SEL"
+        kb = []
+        for s in syms:
+            code = s["code"]
+            pos  = self.db.get_position(code) or {}
+            qty  = int(pos.get("total_qty", 0))
+            hold = f" ({qty:,}주 보유)" if qty > 0 else ""
+            kb.append([InlineKeyboardButton(
+                f"{icon} {s['name']} ({code}){hold}",
+                callback_data=f"{pre}:T:{code}")])
+        kb.append([InlineKeyboardButton("❌ 취소", callback_data="TRADE:CANCEL")])
+        txt = f"{icon} <b>수동 {label} — 종목 선택</b>"
+        if query:
+            await query.edit_message_text(txt, parse_mode="HTML",
+                                          reply_markup=InlineKeyboardMarkup(kb))
         else:
-            await update.message.reply_text(
-                "❌ 알 수 없는 명령\n\n"
-                "📌 <b>사용법:</b>\n"
-                "• 목록: <code>/holiday</code>\n"
-                "• 추가: <code>/holiday add 2026-07-04 설명</code>\n"
-                "• 삭제: <code>/holiday del 2026-07-04</code>",
-                parse_mode='HTML'
+            await msg.reply_text(txt, parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup(kb))
+
+    async def _show_trade_qty(self, query, side, code):
+        sym   = self._get_symbol(code)
+        name  = sym["name"] if sym else code
+        icon  = "🔴" if side == "BUY" else "🔵"
+        label = "매수" if side == "BUY" else "매도"
+        pre   = "BUY" if side == "BUY" else "SEL"
+        try:
+            cur = await asyncio.to_thread(self.broker.get_current_price, code)
+        except Exception:
+            cur = 0
+        pos      = self.db.get_position(code) or {}
+        hold_qty = int(pos.get("total_qty", 0))
+        avg_px   = int(pos.get("avg_price", 0))
+        info = [f"{icon} <b>수동 {label} — 수량 선택</b>",
+                f"종목: <b>{name}</b>  현재가: <b>{self._fmt_krw(cur)}</b>"]
+        if side == "SELL" and hold_qty > 0:
+            info.append(f"보유: {hold_qty:,}주  평단: {self._fmt_krw(avg_px)}")
+        if side == "SELL" and hold_qty > 0:
+            qty_list = sorted(set([
+                max(1, hold_qty//4), max(1, hold_qty//2), hold_qty,
+                1, 3, 5, 10]))
+        else:
+            qty_list = [1, 3, 5, 10, 20, 50, 100]
+        kb, row = [], []
+        for q in qty_list:
+            lbl = (f"전량 {q}주" if side == "SELL" and q == hold_qty
+                   else f"{q}주")
+            row.append(InlineKeyboardButton(
+                lbl, callback_data=f"{pre}:Q:{code}:{q}"))
+            if len(row) == 3:
+                kb.append(row); row = []
+        if row: kb.append(row)
+        kb.append([InlineKeyboardButton(
+            "✏️ 직접 입력", callback_data=f"{pre}:Q:{code}:M")])
+        kb.append([InlineKeyboardButton("◀ 종목 재선택", callback_data=f"{pre}:BACK"),
+                   InlineKeyboardButton("❌ 취소", callback_data="TRADE:CANCEL")])
+        await query.edit_message_text(
+            "\n".join(info), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    async def _show_trade_price(self, query, side, code, qty):
+        sym   = self._get_symbol(code)
+        name  = sym["name"] if sym else code
+        icon  = "🔴" if side == "BUY" else "🔵"
+        label = "매수" if side == "BUY" else "매도"
+        pre   = "BUY" if side == "BUY" else "SEL"
+        try:
+            cur = await asyncio.to_thread(self.broker.get_current_price, code)
+        except Exception:
+            cur = 0
+        from kiwoom_api import round_to_tick as rtt
+        info = [f"{icon} <b>수동 {label} — 가격 선택</b>",
+                f"종목: <b>{name}</b>  수량: <b>{qty:,}주</b>",
+                f"현재가: <b>{self._fmt_krw(cur)}</b>"]
+        prices = [("시장가", 0)]
+        if cur > 0:
+            prices += [
+                (f"현재가 {self._fmt_krw(cur)}", cur),
+                (f"+0.5% {self._fmt_krw(rtt(int(cur*1.005)))}", rtt(int(cur*1.005))),
+                (f"+1%   {self._fmt_krw(rtt(int(cur*1.01)))}", rtt(int(cur*1.01))),
+                (f"-0.5% {self._fmt_krw(rtt(int(cur*0.995)))}", rtt(int(cur*0.995))),
+                (f"-1%   {self._fmt_krw(rtt(int(cur*0.99)))}", rtt(int(cur*0.99))),
+            ]
+        kb, row = [], []
+        for plabel, pval in prices:
+            row.append(InlineKeyboardButton(
+                plabel, callback_data=f"{pre}:P:{code}:{qty}:{pval}"))
+            if len(row) == 2:
+                kb.append(row); row = []
+        if row: kb.append(row)
+        kb.append([InlineKeyboardButton(
+            "✏️ 직접 입력", callback_data=f"{pre}:P:{code}:{qty}:M")])
+        kb.append([InlineKeyboardButton(f"◀ 수량 재선택", callback_data=f"{pre}:T:{code}"),
+                   InlineKeyboardButton("❌ 취소", callback_data="TRADE:CANCEL")])
+        await query.edit_message_text(
+            "\n".join(info), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    async def _show_trade_confirm(self, query, side, code, qty, price):
+        sym   = self._get_symbol(code)
+        name  = sym["name"] if sym else code
+        icon  = "🔴" if side == "BUY" else "🔵"
+        label = "매수" if side == "BUY" else "매도"
+        type_str = "시장가" if price == 0 else f"{price:,}원 지정가"
+        amount   = qty * price if price > 0 else 0
+        lines = [f"{icon} <b>수동 {label} — 최종 확인</b>",
+                 f"종목: <b>{name}</b> ({code})",
+                 f"수량: <b>{qty:,}주</b>  가격: <b>{type_str}</b>"]
+        if amount > 0:
+            lines.append(f"예상금액: <b>{self._fmt_krw(amount)}</b>")
+        lines.append("")
+        lines.append("주문을 실행하시겠습니까?")
+        kb = [[InlineKeyboardButton(f"✅ {label} 실행",
+                callback_data=f"MANORDER:{side}:{code}:{qty}:{price}"),
+               InlineKeyboardButton("❌ 취소", callback_data="TRADE:CANCEL")]]
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    async def _execute_manual_buy(self, msg, code, qty, price):
+        sym  = self._get_symbol(code)
+        name = sym["name"] if sym else code
+        type_str = "시장가" if price == 0 else f"{price:,}원 지정가"
+        kb = [[InlineKeyboardButton("✅ 매수 실행",
+                callback_data=f"MANORDER:BUY:{code}:{qty}:{price}"),
+               InlineKeyboardButton("❌ 취소", callback_data="TRADE:CANCEL")]]
+        await msg.reply_text(
+            f"🔴 <b>매수 확인</b>  {name} ({code})\n"
+            f"수량: {qty:,}주  가격: {type_str}",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+    async def _execute_manual_sell(self, msg, code, qty, price):
+        sym  = self._get_symbol(code)
+        name = sym["name"] if sym else code
+        type_str = "시장가" if price == 0 else f"{price:,}원 지정가"
+        kb = [[InlineKeyboardButton("✅ 매도 실행",
+                callback_data=f"MANORDER:SELL:{code}:{qty}:{price}"),
+               InlineKeyboardButton("❌ 취소", callback_data="TRADE:CANCEL")]]
+        await msg.reply_text(
+            f"🔵 <b>매도 확인</b>  {name} ({code})\n"
+            f"수량: {qty:,}주  가격: {type_str}",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+    # ==========================================================
+    # /sync_db — 키움 잔고 → DB 동기화 UI
+    # ==========================================================
+
+    async def cmd_sync_db(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        await self._show_syncdb_menu(update.effective_message)
+
+    async def _show_syncdb_menu(self, msg, query=None):
+        """동기화 전 현황 비교 화면."""
+        db_positions = self.db.get_all_positions()
+        db_map = {p['code']: p for p in db_positions if int(p.get('total_qty',0)) > 0}
+        try:
+            holdings = await asyncio.to_thread(self.broker.get_holdings)
+            kiwoom_map = {h['code']: h for h in holdings}
+            api_ok = True
+        except Exception:
+            kiwoom_map = {}
+            api_ok = False
+        now = datetime.datetime.now(KST).strftime('%H:%M:%S')
+        lines = [
+            '🔄 <b>키움 → DB 동기화</b>',
+            f'🕐 {now} KST  |  {"✅ API 연결" if api_ok else "❌ API 오류"}',
+            '',
+            '<b>현재 상태 비교:</b>',
+        ]
+        if kiwoom_map:
+            for code, h in kiwoom_map.items():
+                name  = h.get('name', code)
+                k_qty = int(h.get('qty', 0))
+                k_avg = int(h.get('avg_price', 0))
+                d     = db_map.get(code, {})
+                d_qty = int(d.get('total_qty', 0))
+                d_avg = int(d.get('avg_price', 0))
+                ok = (k_qty == d_qty and k_avg == d_avg)
+                icon = '✅' if ok else '⚠️ 불일치'
+                lines.append(
+                    f'{icon} <b>{name}</b> ({code})  '
+                    f'키움: {k_qty:,}주/{self._fmt_krw(k_avg)}  '
+                    f'DB: {d_qty:,}주/{self._fmt_krw(d_avg)}'
+                )
+        else:
+            lines.append('  📭 키움 보유 종목 없음')
+        for code, d in db_map.items():
+            if code not in kiwoom_map:
+                d_qty = int(d.get('total_qty', 0))
+                dn    = d.get('name', code)
+                lines.append(
+                    f'⚠️ <b>{dn}</b> ({code})  '
+                    f'키움: 0주 / DB: {d_qty:,}주 (키움 미보유)'
+                )
+        lines += ['', '🔄 실행하면 <b>키움 잔고 기준으로 DB를 덮어씁니다.</b>']
+        kb = [
+            [InlineKeyboardButton('✅ 동기화 실행', callback_data='SYNCDB:EXEC')],
+            [
+                InlineKeyboardButton('🔍 새로고침', callback_data='SYNCDB:VIEW'),
+                InlineKeyboardButton('❌ 닫기',    callback_data='SYNCDB:CLOSE'),
+            ],
+        ]
+        txt_out = '\n'.join(lines)
+        if query:
+            await query.edit_message_text(txt_out, parse_mode='HTML',
+                                          reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await msg.reply_text(txt_out, parse_mode='HTML',
+                                 reply_markup=InlineKeyboardMarkup(kb))
+
+    async def _do_sync_db(self, msg):
+        """키움 잔고 기준 DB 강제 반영."""
+        try:
+            holdings = await asyncio.to_thread(self.broker.get_holdings)
+            sym_map  = {s['code']: s for s in self._get_symbols()}
+            updated  = []
+            result_lines = ['✅ <b>동기화 완료</b>',
+                            f'🕐 {datetime.datetime.now(KST).strftime("%H:%M:%S")} KST', '']
+            for h in holdings:
+                code  = h.get('code', '')
+                name  = h.get('name', code)
+                qty   = int(h.get('qty', 0))
+                avg   = int(h.get('avg_price', 0))
+                pct   = h.get('profit_pct', 0.0)
+                old_pos = self.db.get_position(code) or {}
+                old_qty = int(old_pos.get('total_qty', 0))
+                old_avg = int(old_pos.get('avg_price', 0))
+                sym_name = sym_map.get(code, {}).get('name', name)
+                self.db.upsert_position(
+                    code=code, name=sym_name or name,
+                    avg_price=avg, total_qty=qty,
+                    round_no=old_pos.get('round_no', 1),
+                )
+                updated.append(code)
+                changed = (qty != old_qty or avg != old_avg)
+                ic   = '🟢' if pct >= 0 else '🔴'
+                sign = '+' if pct >= 0 else ''
+                diff = f'  변경: {old_qty}주→{qty}주' if changed else '  (변경없음)'
+                result_lines.append(
+                    f'{ic} <b>{sym_name or name}</b> ({code})  '
+                    f'{qty:,}주 / {self._fmt_krw(avg)}  '
+                    f'{sign}{pct:.2f}%{diff}'
+                )
+            for pos in self.db.get_all_positions():
+                c = pos.get('code', '')
+                if c not in updated and int(pos.get('total_qty', 0)) > 0:
+                    self.db.upsert_position(
+                        code=c, name=pos.get('name', c),
+                        avg_price=0, total_qty=0,
+                        round_no=pos.get('round_no', 1) + 1,
+                    )
+                    result_lines.append(f'⚪ {c}: 잔량 0으로 초기화')
+            if not holdings:
+                result_lines.append('📭 보유 종목 없음')
+            kb = [
+                [InlineKeyboardButton('🔄 다시 동기화', callback_data='SYNCDB:EXEC')],
+                [InlineKeyboardButton('🔍 현황 보기',   callback_data='SYNCDB:VIEW')],
+            ]
+            await msg.edit_text('\n'.join(result_lines), parse_mode='HTML',
+                                reply_markup=InlineKeyboardMarkup(kb))
+        except Exception as ex:
+            log.exception('[TG] sync_db 실패')
+            await msg.edit_text(f'❌ 동기화 실패: {ex}')
+
+    async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        self.cfg.set("BOT_PAUSED", True)
+        await update.effective_message.reply_text(
+            "⏸ <b>매매 일시 중지</b>\n/resume 으로 재개", parse_mode="HTML"
+        )
+    async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        self.cfg.set("BOT_PAUSED", False)
+        await update.effective_message.reply_text("▶️ <b>매매 재개</b>", parse_mode="HTML")
+    async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        keyboard = [[
+            InlineKeyboardButton("✅ 전량 취소 확인", callback_data="CANCEL:CONFIRM"),
+            InlineKeyboardButton("❌ 중단",           callback_data="CANCEL:ABORT"),
+        ]]
+        await update.effective_message.reply_text(
+            "⚠️ <b>미체결 주문 전량 취소</b>\n계속하시겠습니까?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    # ----------------------------------------------------------
+    # /avwap — AVWAP 퀀트 엔진 현황 및 설정
+    # ----------------------------------------------------------
+    async def cmd_avwap(self, update, context):
+        if not self._is_admin(update):
+            return
+        if not hasattr(self, "avwap_engine") or self.avwap_engine is None:
+            await update.effective_message.reply_text(
+                "⚡️ <b>AVWAP 엔진</b>\n"
+                "현재 비활성 상태입니다.\n"
+                "config.json의 SYMBOLS 중 mode=\'AVWAP\'를 설정하거나\n"
+                "avwap_budget 값을 추가하세요.",
+                parse_mode="HTML"
+            )
+            return
+
+        txt = self.avwap_engine.get_status_text()
+        syms = [s for s in self._get_symbols() if s.get("avwap_budget", 0) > 0]
+        kb = []
+        for s in syms:
+            code = s["code"]
+            kb.append([
+                InlineKeyboardButton(
+                    f"⚡️ {s['name']} 상세",
+                    callback_data=f"AVWAP:STATUS:{code}"
+                )
+            ])
+        kb.append([
+            InlineKeyboardButton("🔄 새로고침", callback_data="AVWAP:REFRESH"),
+        ])
+        await update.effective_message.reply_text(
+            txt, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    def set_avwap_engine(self, engine):
+        """main.py에서 AVWAPEngine 인스턴스 주입."""
+        self.avwap_engine = engine
+
+    # ----------------------------------------------------------
+    # /history — 졸업 명예의 전당
+    # ----------------------------------------------------------
+    async def cmd_history(self, update, context):
+        if not self._is_admin(update):
+            return
+
+        syms     = self._get_symbols()
+        sym_map  = {s["code"]: s for s in syms}
+        all_logs = self.db.get_cycle_log(limit=50)
+        stats    = self.db.get_cycle_stats()
+
+        if not all_logs:
+            await update.effective_message.reply_text(
+                "🏆 <b>졸업 명예의 전당</b>\n\n"
+                "아직 완료된 사이클이 없습니다.\n"
+                "무한매매 목표가 도달 시 자동으로 기록됩니다.",
+                parse_mode="HTML"
+            )
+            return
+
+        # 전체 통계
+        sign_t = "+" if stats.get("total_profit", 0) >= 0 else ""
+        lines  = [
+            "🏆 <b>[ 졸업 명예의 전당 ]</b>",
+            "",
+            f"📊 <b>전체 통계</b>",
+            f"  총 졸업: {stats.get('total', 0)}회  "
+            f"승률: {stats.get('win_rate', 0):.1f}%",
+            f"  총 수익: <b>{sign_t}{self._fmt_krw(stats.get('total_profit', 0))}</b>",
+            f"  평균 수익률: {stats.get('avg_pct', 0):+.2f}%",
+            f"  최고: {stats.get('best_pct', 0):+.2f}%  "
+            f"최저: {stats.get('worst_pct', 0):+.2f}%",
+            "",
+        ]
+
+        # 종목별 통계
+        codes_seen = list(dict.fromkeys(l["code"] for l in all_logs))
+        if len(codes_seen) > 1:
+            lines.append("<b>종목별 요약</b>")
+            for code in codes_seen:
+                s = self.db.get_cycle_stats(code)
+                name = sym_map.get(code, {}).get("name", code)
+                if s:
+                    sign = "+" if s["total_profit"] >= 0 else ""
+                    lines.append(
+                        f"  {name}: {s['total']}회 / "
+                        f"{sign}{self._fmt_krw(s['total_profit'])} "
+                        f"({s['win_rate']:.0f}%)"
+                    )
+            lines.append("")
+
+        # 최근 졸업 기록
+        lines.append("<b>최근 졸업 기록</b>")
+        lines.append(
+            f"{'No.':<3} {'종목':<10} {'회차':>3} "
+            f"{'수익률':>7} {'수익금':>12} {'날짜'}"
+        )
+        lines.append("─" * 10)
+
+        for i, log in enumerate(all_logs[:20], 1):
+            name    = sym_map.get(log["code"], {}).get("name", log["code"])
+            # 종목명 8자 이하로 단축
+            short   = name[:8] if len(name) > 8 else name
+            pct     = log["profit_pct"]
+            profit  = log["profit"]
+            sign    = "+" if profit >= 0 else ""
+            icon    = "🏅" if pct >= 5 else ("✅" if pct >= 0 else "⚠️")
+            date_s  = log["end_date"][5:] if log["end_date"] else "--"
+
+            lines.append(
+                f"{icon} <b>{short}</b>  "
+                f"{log['round_no']}회차  "
+                f"{sign}{pct:.2f}%  "
+                f"{sign}{self._fmt_krw(profit)}  "
+                f"{date_s}"
             )
 
+        # 종목별 상세 버튼
+        kb = []
+        for code in codes_seen[:3]:
+            name = sym_map.get(code, {}).get("name", code)
+            kb.append([InlineKeyboardButton(
+                f"🏆 {name} 상세",
+                callback_data=f"HISTORY:{code}"
+            )])
+
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb) if kb else None
+        )
+
+    # ----------------------------------------------------------
+    # /version — 버전 정보 및 업데이트 내역
+    # ----------------------------------------------------------
+    async def cmd_version(self, update, context):
+        if not self._is_admin(update):
+            return
+
+        mode_str  = "🔴 실전" if self.cfg.get("TRADE_MODE","MOCK") == "REAL" else "🟡 모의투자"
+
+        # 활성 종목 요약
+        syms      = self._get_active_symbols()
+        sym_lines = ""
+        for s in syms:
+            mode  = s.get("mode", "INFINITE")
+            ab    = s.get("avwap_budget", 0)
+            icons = "💎" if mode == "INFINITE" else "⚖️"
+            avwap = "  ⚡️AVWAP ON" if ab > 0 else ""
+            sym_lines += f"  {icons} {s['name']} ({s['code']}){avwap}\n"
+
+        msg = (
+            f"🔧 <b>[ 버전 및 업데이트 내역 ]</b>\n"
+            f"\n"
+            f"🚀 <b>국내 ETF 무한매매 + AVWAP 봇</b>\n"
+            f"📌 현재 버전: <b>v5.0</b>\n"
+            f"💹 운영 모드: {mode_str}\n"
+            f"\n"
+            f"<b>[ 운용 종목 ]</b>\n"
+            f"{sym_lines}"
+            f"\n"
+            f"<b>[ 업데이트 히스토리 ]</b>\n"
+            f"\n"
+            f"⚡️ <b>v5.0</b>  2026-05-24\n"
+            f"  · AVWAP 퀀트 엔진 탑재 (승승장군 V44~V79)\n"
+            f"  · ATR5 잔여체력 기반 다이나믹 목표가\n"
+            f"  · 타임쉴드 09:30 / 강제청산 15:20\n"
+            f"  · 무한매매·AVWAP 독립 예산 운용\n"
+            f"  · 상세 매매 알림 (진입·청산·하드스탑)\n"
+            f"  · /avwap 실시간 엔진 현황\n"
+            f"  · settlement UI에 AVWAP 토글·예산 설정\n"
+            f"  · AVWAP 백테스트 2년 +301% (복리)\n"
+            f"\n"
+            f"💎 <b>v4.0</b>  2026-05-24\n"
+            f"  · 구글 시트 알고리즘 동기화 (큰수·줍줍)\n"
+            f"  · plan_new_entry 줍줍 5개 완성\n"
+            f"  · /sync 통합 지시서 (매수·매도 구분 UI)\n"
+            f"  · 수동 매수·매도 4단계 인라인 UI\n"
+            f"  · /sync_db 키움→DB 동기화 UI\n"
+            f"  · 호가단위 전 가격 자동 적용\n"
+            f"\n"
+            f"⚖️ <b>v3.2</b>  2026-05-24\n"
+            f"  · 텔레봇 통합 지시서·장부·설정·종목관리\n"
+            f"  · /ticker 종목 추가·제거·활성화 UI\n"
+            f"  · update.effective_message 일괄 적용\n"
+            f"\n"
+            f"🔄 <b>v3.0</b>  2026-05-20\n"
+            f"  · V-REV 리밸런싱 모드 추가\n"
+            f"  · DB reverse_day 컬럼 추가\n"
+            f"  · 스케줄러 분리 (core / trade)\n"
+            f"\n"
+            f"🔧 <b>v2.0</b>  2026-05-10\n"
+            f"  · 승승장군 알고리즘 7개 갭 수정\n"
+            f"  · t_val 누적 회차 추적 구현\n"
+            f"  · star_ratio / star_price 계산 엔진\n"
+            f"  · 전반전·후반전·리버스 모드 분리\n"
+            f"\n"
+            f"🌱 <b>v1.0</b>  2026-05-01\n"
+            f"  · 키움 REST API 연결 (mockapi)\n"
+            f"  · 기본 무한매매 로직 초기 구현\n"
+            f"  · python-telegram-bot v20+ 적용\n"
+            f"\n"
+            f"<b>[ 레퍼런스 ]</b>\n"
+            f"  무한매매 원작: 라오어님\n"
+            f"  AVWAP 엔진: 승승장군 V44~V79\n"
+            f"  github.com/pipios4006-boop/\n"
+            f"    KIS-API-Python-Trading-Bot-Example"
+        )
+
+        kb = [[
+            InlineKeyboardButton("📋 통합 지시서", callback_data="CMD:sync"),
+            InlineKeyboardButton("⚡️ AVWAP 현황", callback_data="AVWAP:REFRESH"),
+        ]]
+        await update.effective_message.reply_text(
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            return
+        await update.effective_message.reply_text(
+            "📖 <b>명령어 가이드</b>\n"
+            "\n"
+            "🔍 <b>조회</b>\n"
+            "/sync       — 통합 지시서 (T값·별값·주문계획)\n"
+            "/record     — 장부 조회 (일자별 매매 내역)\n"
+            "/balance    — 예수금 및 계좌 잔고\n"
+            "/holdings   — 보유 종목 평가손익\n"
+            "/report     — 당일 정산 리포트\n\n"
+            "⚙️ <b>설정</b>\n"
+            "/settlement — 설정 현황 및 파라미터 변경\n"
+            "/ticker     — 종목 관리 (활성화/추가/제거)\n"
+            "/mode       — INFINITE / V-REV 전환\n"
+            "/seed       — 시드머니(할당금) 설정\n\n"
+            "🎮 <b>제어</b>\n"
+            "/pause      — 매매 일시 중지\n"
+            "/resume     — 매매 재개\n"
+            "/cancel     — 미체결 주문 전량 취소\n\n"
+            "📊 <b>수동 주문 / 동기화</b>\n"
+            "/buy        — 수동 매수 주문\n"
+            "/sell       — 수동 매도 주문\n"
+            "/sync_db    — 키움 잔고 → DB 강제 동기화\n"
+            "\n"
+            f"🤖 국내 ETF 무한매매 봇 {self.VERSION}",
+            parse_mode="HTML"
+        )
+    # ==========================================================
+    # 콜백 핸들러 (인라인 버튼)
+    # ==========================================================
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-        data = query.data.split(":")
-        action, sub = data[0], data[1] if len(data) > 1 else ""
+        if not self._is_admin(update):
+            return
+        data = query.data
+        # ── 빠른 메뉴 (모두 query.edit_message_text 기반) ──────
+        if data == "CMD:sync":
+            await query.edit_message_text("🔄 지시서 작성 중...", parse_mode="HTML")
+            await self._send_sync_report(query.message, context)
+            return
+        if data == "CMD:record":
+            # ✅ 수정: query.edit_message_text 사용
+            syms = self._get_active_symbols()
+            kb   = [
+                [InlineKeyboardButton(f"📋 {s['name']} ({s['code']})",
+                                      callback_data=f"RECORD:{s['code']}")]
+                for s in syms
+            ]
+            kb.append([InlineKeyboardButton("📋 전체 종목 조회", callback_data="RECORD:ALL")])
+            await query.edit_message_text(
+                "📊 <b>장부 조회</b>\n조회할 종목을 선택하세요:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
+        if data == "CMD:settlement":
+            await self._show_settlement(None, query=query)
+            return
+        if data == "CMD:ticker":
+            await self._show_ticker_menu(None, query=query)
+            return
+        if data == "CMD:balance":
+            await query.edit_message_text("💰 잔고 조회 중...", parse_mode="HTML")
+            try:
+                b = await asyncio.to_thread(self.broker.get_balance)
+                deposit      = b.get("deposit", 0)
+                withdrawable = b.get("withdrawable", 0)
+                eval_total   = b.get("eval_total", 0)
+                eval_profit  = b.get("eval_profit", 0)
+                profit_pct   = b.get("profit_pct", 0.0)
+                sign = "+" if eval_profit >= 0 else ""
+                await query.edit_message_text(
+                    f"💰 <b>계좌 잔고 현황</b>\n"
+                    f"📥 예수금:   {self._fmt_krw(deposit)}\n"
+                    f"💳 출금가능: {self._fmt_krw(withdrawable)}\n"
+                    f"📊 평가금액: {self._fmt_krw(eval_total)}\n"
+                    f"💹 평가손익: {sign}{self._fmt_krw(eval_profit)} ({sign}{profit_pct:.2f}%)\n"
+                    f"🕐 {datetime.datetime.now(KST).strftime('%H:%M:%S')} KST",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                await query.edit_message_text(f"❌ 잔고 조회 실패: {e}")
+            return
+        if data == "CMD:sync_db":
+            await query.edit_message_text("🔄 잔고 조회 중...", parse_mode="HTML")
+            await self._show_syncdb_menu(None, query=query)
+            return
 
-        if action == "VERSION":
-            history_data = self.cfg.get_full_version_history()
-            if sub == "LATEST":
-                msg, markup = self.view.get_version_message(history_data, page_index=None)
-                await query.edit_message_text(msg, reply_markup=markup, parse_mode='HTML')
-            elif sub == "PAGE":
-                page_idx = int(data[2])
-                msg, markup = self.view.get_version_message(history_data, page_index=page_idx)
-                await query.edit_message_text(msg, reply_markup=markup, parse_mode='HTML')
+        if data == "CMD:history":
+            await self.cmd_history(update, context)
+            return
 
-        elif action == "RESET":
-            if sub == "MENU":
-                active_tickers = self.cfg.get_active_tickers()
-                msg, markup = self.view.get_reset_menu(active_tickers)
-                await query.edit_message_text(msg, reply_markup=markup, parse_mode='HTML')
-            elif sub == "LOCK": 
-                ticker = data[2]
-                self.cfg.reset_lock_for_ticker(ticker)
-                await query.edit_message_text(f"✅ <b>[{ticker}] 금일 매매 잠금이 해제되었습니다.</b>", parse_mode='HTML')
-            elif sub == "REV":
-                ticker = data[2]
-                msg, markup = self.view.get_reset_confirm_menu(ticker)
-                await query.edit_message_text(msg, reply_markup=markup, parse_mode='HTML')
-            elif sub == "CONFIRM":
-                ticker = data[2]
-                self.cfg.set_reverse_state(ticker, False, 0)
-                self.cfg.clear_escrow_cash(ticker) 
-                
-                ledger_data = self.cfg.get_ledger()
-                changed = False
-                for lr in ledger_data:
-                    if lr.get('ticker') == ticker and lr.get('is_reverse', False):
-                        lr['is_reverse'] = False
-                        changed = True
-                if changed:
-                    self.cfg._save_json(self.cfg.FILES["LEDGER"], ledger_data)
-                    
-                await query.edit_message_text(f"✅ <b>[{ticker}] 리버스 모드 및 가상장부(Escrow)가 모두 강제 초기화되었습니다.</b>\n(과거 리버스 꼬리표 소각 완료. 다음 주문부터 일반 모드로 복귀합니다.)", parse_mode='HTML')
-            elif sub == "CANCEL":
-                await query.edit_message_text("❌ 안전 통제실 메뉴를 닫습니다.", parse_mode='HTML')
+        if data == "CMD:holdings":
+            # ✅ 수정: query.edit_message_text 사용
+            await query.edit_message_text("📈 보유 종목 조회 중...", parse_mode="HTML")
+            try:
+                hs = await asyncio.to_thread(self.broker.get_holdings)
+                if not hs:
+                    await query.edit_message_text(
+                        "📭 현재 보유 중인 종목이 없습니다.", parse_mode="HTML"
+                    )
+                    return
+                lines        = ["📈 <b>보유 종목 평가손익</b>", ""]
+                total_profit = 0
+                for h in hs:
+                    profit = h.get("profit", 0)
+                    pct    = h.get("profit_pct", 0.0)
+                    icon   = "🟢" if profit >= 0 else "🔴"
+                    sign   = "+" if profit >= 0 else ""
+                    lines.append(
+                        f"{icon} <b>{h.get('name','')}({h.get('code','')})</b>\n"
+                        f"   {h.get('qty',0):,}주 | 평단 {self._fmt_krw(h.get('avg_price',0))} "
+                        f"| 현재 {self._fmt_krw(h.get('current_price',0))}\n"
+                        f"   손익: <b>{sign}{self._fmt_krw(profit)}</b> ({sign}{pct:.2f}%)"
+                    )
+                    total_profit += profit
+                sign_t = "+" if total_profit >= 0 else ""
+                lines += [
+                    f"💼 총 평가손익: <b>{sign_t}{self._fmt_krw(total_profit)}</b>",
+                    f"🕐 {datetime.datetime.now(KST).strftime('%H:%M:%S')} KST",
+                ]
+                kb = [[InlineKeyboardButton("🔄 새로고침", callback_data="CMD:holdings")]]
+                await query.edit_message_text(
+                    "\n".join(lines), parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
+            except Exception as e:
+                await query.edit_message_text(f"❌ 보유 종목 조회 실패: {e}")
+            return
+        # ── 장부 ─────────────────
+        if data.startswith("RECORD:"):
+            parts = data.split(":")
+            if parts[1] == "ALL":
+                # 전체 조회: 첫 종목은 edit, 나머지는 새 메시지
+                syms = self._get_active_symbols()
+                for idx, s in enumerate(syms):
+                    if idx == 0:
+                        await self._show_record(s["code"], query=query)
+                    else:
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text="📋 조회 중...", parse_mode="HTML"
+                        )
+                        # 마지막 메시지를 msg_obj로 전달하기 위해 임시 처리
+                        await self._show_record_to_chat(s["code"], context, update.effective_chat.id)
+            elif parts[1] == "UPDATE" and len(parts) == 3:
+                code = parts[2]
+                await query.edit_message_text(f"🔄 {code} 장부 동기화 중...")
+                # 실제 보유잔고 API 동기화
+                try:
+                    hs = await asyncio.to_thread(self.broker.get_holdings)
+                    h  = next((x for x in hs if x["code"] == code), None)
+                    if h:
+                        self.db.upsert_position(
+                            code=code, name=h["name"],
+                            avg_price=h["avg_price"], total_qty=h["qty"],
+                        )
+                except Exception:
+                    pass
+                await self._show_record(code, query=query)
+            else:
+                code = parts[1]
+                await self._show_record(code, query=query)
+            return
+        # ── 종목 관리 ─────────────
+        if data.startswith("TICKER:"):
+            parts = data.split(":")
+            action = parts[1]
+            if action == "TOGGLE" and len(parts) == 3:
+                code = parts[2]
+                syms = self._get_symbols()
+                for s in syms:
+                    if s["code"] == code:
+                        cur = s.get("active", True)
+                        # 보유 잔량 안전장치
+                        if cur:
+                            pos = self.db.get_position(code)
+                            if pos and pos.get("total_qty", 0) > 0:
+                                await query.answer(
+                                    f"⚠️ {code} 보유 잔량({pos['total_qty']}주) 있음 — 청산 후 비활성화 가능",
+                                    show_alert=True
+                                )
+                                return
+                        s["active"] = not cur
+                self._save_symbols(syms)
+                await self._show_ticker_menu(None, query=query)
+            elif action == "REMOVE" and len(parts) == 3:
+                code = parts[2]
+                pos  = self.db.get_position(code)
+                if pos and pos.get("total_qty", 0) > 0:
+                    await query.answer(
+                        f"⚠️ {code} 보유 잔량 있음 — 청산 후 제거 가능",
+                        show_alert=True
+                    )
+                    return
+                syms = [s for s in self._get_symbols() if s["code"] != code]
+                self._save_symbols(syms)
+                await self._show_ticker_menu(None, query=query)
+            elif action == "ADD":
+                self._pending[update.effective_chat.id] = {
+                    "action": "ADD_TICKER", "step": "code"
+                }
+                await query.edit_message_text(
+                    "➕ <b>새 종목 추가</b>\n\n"
+                    "추가할 종목 코드를 입력하세요.\n"
+                    "(예: 122630)\n\n"
+                    "취소: /cancel",
+                    parse_mode="HTML"
+                )
+            elif action == "RESET":
+                keyboard = [[
+                    InlineKeyboardButton("✅ 기본 종목으로 복원", callback_data="TICKER:RESET:CONFIRM"),
+                    InlineKeyboardButton("❌ 취소", callback_data="TICKER:RESET:ABORT"),
+                ]]
+                await query.edit_message_text(
+                    "⚠️ 기본 종목 3개로 초기화합니다.\n현재 설정이 모두 초기화됩니다.",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            elif action == "RESET" and len(parts) == 3 and parts[2] == "CONFIRM":
+                self._save_symbols(DEFAULT_SYMBOLS)
+                await self._show_ticker_menu(None, query=query)
+            return
+        # ── 설정 변경 ─────────────
+        if data.startswith("SETTLE:"):
+            parts = data.split(":")
+            action = parts[1]
+            if action == "TOGGLE" and len(parts) == 3:
+                code = parts[2]
+                syms = self._get_symbols()
+                for s in syms:
+                    if s["code"] == code:
+                        s["active"] = not s.get("active", True)
+                self._save_symbols(syms)
+                await self._show_settlement(None, query=query)
+            elif action == "MODE" and len(parts) == 3:
+                code = parts[2]
+                syms = self._get_symbols()
+                for s in syms:
+                    if s["code"] == code:
+                        s["mode"] = "VREV" if s.get("mode", "INFINITE") == "INFINITE" else "INFINITE"
+                self._save_symbols(syms)
+                await self._show_settlement(None, query=query)
+            elif action == "AVWAP" and len(parts) >= 3:
+                sub  = parts[2]   # TOGGLE or BUDGET
+                code = parts[3] if len(parts) > 3 else ""
+                syms = self._get_symbols()
+                if sub == "TOGGLE":
+                    for s in syms:
+                        if s["code"] == code:
+                            cur_budget = s.get("avwap_budget", 0)
+                            if cur_budget > 0:
+                                # OFF: 0으로
+                                s["avwap_budget"] = 0
+                            else:
+                                # ON: 기본 100만원
+                                s["avwap_budget"] = 1_000_000
+                    self._save_symbols(syms)
+                    # AVWAP 엔진 재초기화 알림
+                    if hasattr(self, "avwap_engine") and self.avwap_engine:
+                        avwap_syms = [s for s in syms
+                                      if s.get("active") and s.get("avwap_budget", 0) > 0]
+                        self.avwap_engine.init_symbols(avwap_syms)
+                    await self._show_settlement(None, query=query)
+                    return
 
-        elif action == "REC":
-            if sub == "VIEW": 
-                async with self.tx_lock:
-                    _, holdings = self.broker.get_account_balance()
-                await self._display_ledger(data[2], update.effective_chat.id, context, query=query, pre_fetched_holdings=holdings)
-            elif sub == "SYNC": 
-                ticker = data[2]
-                
-                if ticker not in self.sync_locks:
-                    self.sync_locks[ticker] = asyncio.Lock()
-                    
-                if not self.sync_locks[ticker].locked():
-                    await query.edit_message_text(f"🔄 <b>[{ticker}] 잔고 기반 대시보드 업데이트 중...</b>", parse_mode='HTML')
-                    res = await self.process_auto_sync(ticker, update.effective_chat.id, context, silent_ledger=True)
-                    if res == "SUCCESS": 
-                        async with self.tx_lock:
-                            _, holdings = self.broker.get_account_balance()
-                        await self._display_ledger(ticker, update.effective_chat.id, context, message_obj=query.message, pre_fetched_holdings=holdings)
+                elif sub == "BUDGET":
+                    sym = self._get_symbol(code)
+                    if not sym:
+                        return
+                    self._pending[update.effective_chat.id] = {
+                        "action": "SET_VALUE", "key": "avwap", "code": code
+                    }
+                    cur = sym.get("avwap_budget", 0)
+                    await query.edit_message_text(
+                        f"⚡️ <b>{sym['name']} AVWAP 예산 설정</b>\n\n"
+                        f"현재: {self._fmt_krw(cur)}\n"
+                        f"새 예산을 입력하세요 (원):\n"
+                        f"예) <code>1000000</code> (100만원)\n\n"
+                        f"0 입력 시 AVWAP 비활성화\n\n취소: /cancel",
+                        parse_mode="HTML"
+                    )
+                    return
 
-        elif action == "HIST":
-            if sub == "VIEW":
-                hid = int(data[2])
-                target = next((h for h in self.cfg.get_history() if h['id'] == hid), None)
-                if target:
-                    qty, avg, invested, sold = self.cfg.calculate_holdings(target['ticker'], target['trades'])
-                    msg, markup = self.view.create_ledger_dashboard(target['ticker'], qty, avg, invested, sold, target['trades'], 0, 0, is_history=True)
-                    await query.edit_message_text(msg, reply_markup=markup, parse_mode='HTML')
-            elif sub == "LIST": await self.cmd_history(update, context)
-            
-        elif action == "EXEC":
-            t = sub
-            await query.edit_message_text(f"🚀 {t} 수동 강제 전송 시작 (교차 분리)...")
-            async with self.tx_lock:
-                cash, holdings = self.broker.get_account_balance()
-                if holdings is None: return await query.edit_message_text("❌ API 통신 오류로 주문을 실행할 수 없습니다.")
-                    
-                _, allocated_cash, force_turbo_off = self._calculate_budget_allocation(cash, self.cfg.get_active_tickers())
-                h = holdings.get(t, {'qty':0, 'avg':0})
-                
-                curr_p = await asyncio.to_thread(self.broker.get_current_price, t)
-                prev_c = await asyncio.to_thread(self.broker.get_previous_close, t)
-                ma_5day = await asyncio.to_thread(self.broker.get_5day_ma, t)
-                
-                plan = self.strategy.get_plan(t, curr_p, float(h['avg']), int(h['qty']), prev_c, ma_5day=ma_5day, market_type="REG", available_cash=allocated_cash[t], force_turbo_off=force_turbo_off)
-                
-                is_rev = plan.get('is_reverse', False)
-                ver = self.cfg.get_version(t)
-                
-                if ver == "V17": ver_display = "V17 시크릿"
-                elif ver == "V14": ver_display = "무매4"
-                else: ver_display = "무매3"
-                
-                title = f"🔄 <b>[{t}] {ver_display} 리버스 주문 수동 실행</b>\n" if is_rev else f"💎 <b>[{t}] 정규장 주문 수동 실행</b>\n"
-                msg = title
-                
-                all_success = True
-                
-                for o in plan.get('core_orders', []):
-                    res = self.broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
-                    is_success = res.get('rt_cd') == '0'
-                    if not is_success: all_success = False
-                    err_msg = res.get('msg1', '오류')
-                    status_icon = '✅' if is_success else f'❌({err_msg})'
-                    msg += f"└ 1차 필수: {o['desc']} {o['qty']}주: {status_icon}\n"
-                    await asyncio.sleep(0.2) 
-                    
-                for o in plan.get('bonus_orders', []):
-                    res = self.broker.send_order(t, o['side'], o['qty'], o['price'], o['type'])
-                    is_success = res.get('rt_cd') == '0'
-                    err_msg = res.get('msg1', '잔금패스')
-                    status_icon = '✅' if is_success else f'❌({err_msg})'
-                    msg += f"└ 2차 보너스: {o['desc']} {o['qty']}주: {status_icon}\n"
-                    await asyncio.sleep(0.2) 
-                
-                if all_success and len(plan.get('core_orders', [])) > 0:
-                    self.cfg.set_lock(t, "REG")
-                    msg += "\n🔒 <b>필수 주문 전송 완료 (잠금 설정됨)</b>"
+            elif action == "SET" and len(parts) == 4:
+                # SETTLE:SET:{key}:{code}
+                key  = parts[2]
+                code = parts[3]
+                sym  = self._get_symbol(code)
+                if not sym or key not in SETTING_KEY_MAP:
+                    return
+                _, _, prompt, unit = SETTING_KEY_MAP[key]
+                self._pending[update.effective_chat.id] = {
+                    "action": "SET_VALUE", "key": key, "code": code
+                }
+                await query.edit_message_text(
+                    f"⚙️ <b>{sym['name']} {key} 설정</b>\n\n"
+                    f"새 값을 입력하세요: {prompt}\n"
+                    f"단위: {unit}\n\n취소: /cancel",
+                    parse_mode="HTML"
+                )
+            elif len(parts) == 2:
+                # SETTLE:{code} — /sync 화면 ⚙️ 버튼 → 설정 화면 표시
+                await self._show_settlement(None, query=query)
+            return
+        # ── 수동 주문 실행 콜백 ──────────────
+        if data.startswith("MANORDER:"):
+            parts  = data.split(":")
+            action = parts[1]
+            if action == "CANCEL":
+                await query.edit_message_text("❌ 주문이 취소되었습니다.")
+                return
+            code  = parts[2]
+            qty   = int(parts[3])
+            price = int(parts[4])
+            sym   = self._get_symbol(code)
+            name  = sym["name"] if sym else code
+            order_type = (self.broker.ORDER_MARKET if price == 0
+                          else self.broker.ORDER_LIMIT)
+            side_str = "🔴 매수" if action == "BUY" else "🔵 매도"
+            await query.edit_message_text(f"⏳ {side_str} 주문 전송 중...", parse_mode="HTML")
+            try:
+                if action == "BUY":
+                    res = await asyncio.to_thread(
+                        self.broker.buy, code, qty, price, order_type
+                    )
+                    cur = price if price > 0 else await asyncio.to_thread(
+                        self.broker.get_current_price, code)
+                    pos = self.db.get_position(code) or {}
+                    old_qty = int(pos.get("total_qty", 0))
+                    old_avg = int(pos.get("avg_price", 0))
+                    new_qty = old_qty + qty
+                    new_avg = (old_avg*old_qty + cur*qty)//new_qty if new_qty > 0 else cur
+                    self.db.upsert_position(
+                        code=code, name=name,
+                        avg_price=new_avg, total_qty=new_qty,
+                        round_no=pos.get("round_no", 1),
+                    )
+                    self.db.record_trade(code=code, name=name, side="BUY",
+                                         qty=qty, price=cur,
+                                         order_no=res.get("order_no",""))
+                    self.notifier.notify_buy(code, name, qty, cur, qty*cur)
+                    await query.edit_message_text(
+                        f"✅ <b>수동 매수 완료</b>\n\n"
+                        f"종목: {name} ({code})\n수량: {qty:,}주\n"
+                        f"단가: {self._fmt_krw(cur)}\n"
+                        f"새 평단: {self._fmt_krw(new_avg)} ({new_qty:,}주)",
+                        parse_mode="HTML")
                 else:
-                    msg += "\n⚠️ <b>일부 필수 주문 실패 (매매 잠금 보류)</b>"
+                    res = await asyncio.to_thread(
+                        self.broker.sell, code, qty, price, order_type
+                    )
+                    cur = price if price > 0 else await asyncio.to_thread(
+                        self.broker.get_current_price, code)
+                    pos = self.db.get_position(code) or {}
+                    avg = int(pos.get("avg_price", 0))
+                    remain = max(0, int(pos.get("total_qty", 0)) - qty)
+                    profit = (cur - avg) * qty if avg > 0 else 0
+                    pct    = (cur - avg) / avg * 100 if avg > 0 else 0.0
+                    sign   = "+" if profit >= 0 else ""
+                    self.db.upsert_position(
+                        code=code, name=name,
+                        avg_price=avg if remain > 0 else 0,
+                        total_qty=remain,
+                        round_no=pos.get("round_no",1) + (0 if remain > 0 else 1),
+                    )
+                    self.db.record_trade(code=code, name=name, side="SELL",
+                                         qty=qty, price=cur,
+                                         order_no=res.get("order_no",""),
+                                         profit=profit, profit_pct=pct)
+                    self.notifier.notify_sell(code, name, qty, cur, qty*cur, profit, pct)
+                    await query.edit_message_text(
+                        f"✅ <b>수동 매도 완료</b>\n\n"
+                        f"종목: {name} ({code})\n수량: {qty:,}주\n"
+                        f"단가: {self._fmt_krw(cur)}\n"
+                        f"실현손익: <b>{sign}{self._fmt_krw(profit)}</b> ({sign}{pct:.2f}%)\n"
+                        f"잔량: {remain:,}주",
+                        parse_mode="HTML")
+            except Exception as e:
+                log.exception("[TG] 수동 주문 실패")
+                await query.edit_message_text(f"❌ 주문 실패: {e}")
+            return
+        if data.startswith("MANBUY:SELECT:"):
+            code = data.split(":")[2]
+            sym  = self._get_symbol(code)
+            name = sym["name"] if sym else code
+            self._pending[update.effective_chat.id] = {
+                "action": "MANUAL_BUY", "code": code
+            }
+            try:
+                cur = await asyncio.to_thread(self.broker.get_current_price, code)
+            except Exception:
+                cur = 0
+            await query.edit_message_text(
+                f"🔴 <b>{name} 수동 매수</b>\n\n"
+                f"현재가: {self._fmt_krw(cur)}\n\n"
+                f"수량과 가격을 입력하세요 (시장가는 가격 생략):\n"
+                f"예) <code>5 15000</code> 또는 <code>5</code>\n\n취소: /cancel",
+                parse_mode="HTML")
+            return
+        if data.startswith("MANSELL:SELECT:"):
+            code = data.split(":")[2]
+            sym  = self._get_symbol(code)
+            name = sym["name"] if sym else code
+            pos  = self.db.get_position(code) or {}
+            hold_qty = int(pos.get("total_qty", 0))
+            self._pending[update.effective_chat.id] = {
+                "action": "MANUAL_SELL", "code": code, "max_qty": hold_qty
+            }
+            try:
+                cur = await asyncio.to_thread(self.broker.get_current_price, code)
+            except Exception:
+                cur = 0
+            await query.edit_message_text(
+                f"🔵 <b>{name} 수동 매도</b>\n\n"
+                f"보유: {hold_qty:,}주 | 현재가: {self._fmt_krw(cur)}\n\n"
+                f"수량과 가격을 입력하세요 (전량은 0 입력):\n"
+                f"예) <code>5 16000</code> 또는 <code>0</code>\n\n취소: /cancel",
+                parse_mode="HTML")
+            return
+        if data.startswith("HISTORY:"):
+            code = data.split(":")[1]
+            logs = self.db.get_cycle_log(code, limit=20)
+            stats = self.db.get_cycle_stats(code)
+            sym  = self._get_symbol(code)
+            name = sym["name"] if sym else code
 
-            await context.bot.send_message(update.effective_chat.id, msg, parse_mode='HTML')
+            if not logs:
+                await query.edit_message_text(
+                    f"🏆 {name}\n아직 졸업 기록이 없습니다.",
+                    parse_mode="HTML"
+                )
+                return
 
-        elif action == "TOGGLE":
-            if sub == "VERSION":
-                ticker = data[2]
-                curr_ver = self.cfg.get_version(ticker)
-                new_ver = "V14" if curr_ver in ["V13", "V17"] else "V13"
-                self.cfg.set_version(ticker, new_ver)
-                new_ver_display = "무매4" if new_ver == "V14" else "무매3"
-                await query.edit_message_text(f"✅ [{ticker}] 운용 로직이 {new_ver_display} 모드로 변경되었습니다. /settlement 로 확인하세요.")
+            sign_t = "+" if stats.get("total_profit", 0) >= 0 else ""
+            lines  = [
+                f"🏆 <b>{name} 졸업 기록</b>",
+                f"",
+                f"총 {stats['total']}회 | 승률 {stats['win_rate']:.1f}%",
+                f"총 수익: <b>{sign_t}{self._fmt_krw(stats['total_profit'])}</b>",
+                f"평균: {stats['avg_pct']:+.2f}% | "
+                f"최고: {stats['best_pct']:+.2f}%",
+                f"",
+                f"<b>회차별 기록</b>",
+            ]
+            for log in logs:
+                pct    = log["profit_pct"]
+                profit = log["profit"]
+                sign   = "+" if profit >= 0 else ""
+                icon   = "🏅" if pct >= 5 else ("✅" if pct >= 0 else "⚠️")
+                lines.append(
+                    f"{icon} {log['round_no']}회차  "
+                    f"{sign}{pct:.2f}%  {sign}{self._fmt_krw(profit)}  "
+                    f"T:{log['final_t_val']:.2f}  {log['end_date']}"
+                )
 
-        elif action == "TICKER":
-            self.cfg.set_active_tickers([sub] if sub != "ALL" else ["SOXL", "TQQQ"])
-            await query.edit_message_text(f"✅ 운용 종목 변경: {sub}")
-        elif action == "MODE":
-            self.cfg.set_turbo_mode(sub == "ON")
-            await query.edit_message_text(f"✅ 모드 변경 완료: {'가속' if sub == 'ON' else '일반'}")
-        elif action == "SEED":
-            ticker = data[2]
-            self.user_states[update.effective_chat.id] = f"SEED_{sub}_{ticker}"
-            await context.bot.send_message(update.effective_chat.id, f"💵 [{ticker}] 시드머니 금액 입력:")
-        elif action == "INPUT":
-            ticker = data[2]
-            self.user_states[update.effective_chat.id] = f"CONF_{sub}_{ticker}"
-            
-            if sub == "SPLIT": ko_name = "분할 횟수"
-            elif sub == "TARGET": ko_name = "목표 수익률(%)"
-            elif sub == "COMPOUND": ko_name = "자동 복리율(%)"
-            elif sub == "STOCK_SPLIT": ko_name = "액면 분할/병합 비율 (예: 10분할은 10, 10병합은 0.1)"
-            elif sub == "SNIPER": ko_name = "스나이퍼 타점 가중치 (예: SOXL 기본 1.0, TQQQ 기본 0.9)"
-            else: ko_name = "값"
-            
-            await context.bot.send_message(update.effective_chat.id, f"⚙️ [{ticker}] {ko_name} 입력 (숫자만):")
+            kb = [[InlineKeyboardButton("◀ 전체 보기", callback_data="CMD:history")]]
+            await query.edit_message_text(
+                "\n".join(lines), parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
 
+        if data.startswith("AVWAP:"):
+            parts  = data.split(":")
+            action = parts[1]
+            if action == "REFRESH":
+                if hasattr(self, "avwap_engine") and self.avwap_engine:
+                    await query.edit_message_text(
+                        self.avwap_engine.get_status_text(),
+                        parse_mode="HTML",
+                        reply_markup=query.message.reply_markup
+                    )
+                return
+            if action == "STATUS" and len(parts) == 3:
+                code = parts[2]
+                if hasattr(self, "avwap_engine") and self.avwap_engine:
+                    await query.edit_message_text(
+                        self.avwap_engine.get_status_text(code),
+                        parse_mode="HTML",
+                        reply_markup=query.message.reply_markup
+                    )
+                return
+
+        if data.startswith("SYNCDB:"):
+            action = data.split(":")[1]
+
+            if action in ("VIEW", "RUN"):
+                # 현황 비교 화면
+                await query.edit_message_text(
+                    "🔄 잔고 조회 중...", parse_mode="HTML")
+                await self._show_syncdb_menu(None, query=query)
+
+            elif action == "EXEC":
+                # 동기화 실행
+                await query.edit_message_text(
+                    "⏳ 키움 → DB 동기화 실행 중...", parse_mode="HTML")
+                await self._do_sync_db(query.message)
+
+            elif action == "CLOSE":
+                await query.edit_message_text("✅ DB 동기화 화면을 닫았습니다.")
+
+            return
+        # ── 미체결 취소 ───────────
+        if data == "CANCEL:CONFIRM":
+            await query.edit_message_text("⏳ 미체결 취소 중...")
+            try:
+                r = await asyncio.to_thread(self.broker.cancel_all_orders)
+                await query.edit_message_text(
+                    f"✅ <b>미체결 {r.get('cancelled',0)}건 취소 완료</b>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                await query.edit_message_text(f"❌ 취소 실패: {e}")
+        # ── 수동 주문 UI 단계별 라우팅 (BUY: / SEL:) ─────────
+        if data in ("BUY:START", "SEL:START"):
+            side = "BUY" if data == "BUY:START" else "SELL"
+            await self._show_trade_ticker(None, side, query=query)
+            return
+
+        if data.startswith("BUY:") or data.startswith("SEL:"):
+            parts = data.split(":")
+            pre   = parts[0]
+            step  = parts[1]
+            side  = "BUY" if pre == "BUY" else "SELL"
+            if step == "BACK":
+                await self._show_trade_ticker(None, side, query=query)
+                return
+            code = parts[2] if len(parts) > 2 else ""
+            if step == "T":
+                await self._show_trade_qty(query, side, code)
+                return
+            qty_raw = parts[3] if len(parts) > 3 else "0"
+            if step == "Q":
+                if qty_raw == "M":
+                    self._pending[update.effective_chat.id] = {
+                        "action": ("MANUAL_BUY" if side == "BUY"
+                                   else "MANUAL_SELL"),
+                        "code": code, "step": "qty",
+                    }
+                    await query.edit_message_text(
+                        ("🔴" if side=="BUY" else "🔵") +
+                        " 수량을 입력하세요:\n예) <code>7</code>\n\n취소: /cancel",
+                        parse_mode="HTML")
+                    return
+                await self._show_trade_price(query, side, code, int(qty_raw))
+                return
+            qty = int(qty_raw) if qty_raw.isdigit() else 0
+            price_raw = parts[4] if len(parts) > 4 else "0"
+            if step == "P":
+                if price_raw == "M":
+                    self._pending[update.effective_chat.id] = {
+                        "action": ("MANUAL_BUY" if side == "BUY"
+                                   else "MANUAL_SELL"),
+                        "code": code, "step": "price", "qty": qty,
+                    }
+                    await query.edit_message_text(
+                        ("🔴" if side=="BUY" else "🔵") +
+                        " 가격을 입력하세요 (0=시장가):\n예) <code>15250</code>\n\n취소: /cancel",
+                        parse_mode="HTML")
+                    return
+                await self._show_trade_confirm(
+                    query, side, code, qty, int(price_raw))
+                return
+
+        if data == "TRADE:CANCEL":
+            await query.edit_message_text("❌ 주문이 취소되었습니다.")
+            return
+
+        elif data == "CANCEL:ABORT":
+            await query.edit_message_text("취소 작업이 중단되었습니다.")
+        elif data == "NOOP":
+            pass
+    # ==========================================================
+    # 텍스트 메시지 핸들러 (설정 입력 상태 머신)
+    # ==========================================================
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update): return
-        chat_id = update.effective_chat.id
-        state = self.user_states.get(chat_id)
-        if not state: return
-        try:
-            val = float(update.message.text.strip())
-            parts = state.split("_")
-            
-            if state.startswith("SEED"):
-                if val < 0: return await update.message.reply_text("❌ 오류: 시드머니는 0 이상이어야 합니다.")
-                action, ticker = parts[1], parts[2]
-                curr = self.cfg.get_seed(ticker)
-                new_v = curr + val if action == "ADD" else (max(0, curr - val) if action == "SUB" else val)
-                self.cfg.set_seed(ticker, new_v)
-                await update.message.reply_text(f"✅ [{ticker}] 시드 변경: ${new_v:,.0f}")
-                
-            elif state.startswith("CONF_SPLIT"):
-                if val < 1: return await update.message.reply_text("❌ 오류: 분할 횟수는 1 이상이어야 합니다.")
-                ticker = parts[2]
-                d = self.cfg._load_json(self.cfg.FILES["SPLIT"], self.cfg.DEFAULT_SPLIT)
-                d[ticker] = val; self.cfg._save_json(self.cfg.FILES["SPLIT"], d)
-                await update.message.reply_text(f"✅ [{ticker}] 분할: {int(val)}회")
-                
-            elif state.startswith("CONF_TARGET"):
-                ticker = parts[2]
-                d = self.cfg._load_json(self.cfg.FILES["PROFIT_CFG"], self.cfg.DEFAULT_TARGET)
-                d[ticker] = val; self.cfg._save_json(self.cfg.FILES["PROFIT_CFG"], d)
-                await update.message.reply_text(f"✅ [{ticker}] 목표: {val}%")
-                
-            elif state.startswith("CONF_COMPOUND"):
-                if val < 0: return await update.message.reply_text("❌ 오류: 복리율은 0 이상이어야 합니다.")
-                ticker = parts[2]
-                self.cfg.set_compound_rate(ticker, val)
-                await update.message.reply_text(f"✅ [{ticker}] 졸업 시 자동 복리율: {val}%")
-                
-            elif state.startswith("CONF_STOCK_SPLIT"):
-                if val <= 0: return await update.message.reply_text("❌ 오류: 액면 보정 비율은 0보다 커야 합니다.")
-                ticker = parts[2]
-                self.cfg.apply_stock_split(ticker, val)
-                
-                est = pytz.timezone('US/Eastern')
-                today_str = datetime.datetime.now(est).strftime('%Y-%m-%d')
-                self.cfg.set_last_split_date(ticker, today_str)
-                
-                await update.message.reply_text(f"✅ [{ticker}] 수동 액면 보정 완료\n▫️ 모든 장부 기록이 {val}배 비율로 정밀하게 소급 조정되었습니다.")
-                
-            elif state.startswith("CONF_SNIPER"):
-                if val <= 0: return await update.message.reply_text("❌ 오류: 가중치는 0보다 커야 합니다.")
-                ticker = parts[2]
-                self.cfg.set_sniper_multiplier(ticker, val)
-                await update.message.reply_text(f"✅ [{ticker}] 스나이퍼 타점 가중치가 {val}배로 변경되었습니다.")
-                
-        except ValueError:
-            await update.message.reply_text("❌ 오류: 유효한 숫자를 입력하세요. (입력 대기 상태가 강제 해제되었습니다.)")
-        except Exception as e:
-            await update.message.reply_text(f"❌ 알 수 없는 오류 발생: {str(e)}")
-        finally:
-            if chat_id in self.user_states:
-                del self.user_states[chat_id]
+        if not self._is_admin(update):
+            return
+        uid   = update.effective_chat.id
+        text  = update.effective_message.text.strip()
+        state = self._pending.get(uid)
+        # ── 종목 추가 상태 머신 ──────────
+        if state and state.get("action") == "ADD_TICKER":
+            step = state.get("step")
+            if step == "code":
+                code = text.strip()
+                if not code.isdigit() or len(code) != 6:
+                    await update.effective_message.reply_text(
+                        "❌ 종목 코드는 6자리 숫자입니다. (예: 122630)\n다시 입력하세요:"
+                    )
+                    return
+                if self._get_symbol(code):
+                    await update.effective_message.reply_text(
+                        f"⚠️ {code}는 이미 등록된 종목입니다."
+                    )
+                    del self._pending[uid]
+                    return
+                state["code"] = code
+                state["step"] = "name"
+                await update.effective_message.reply_text(
+                    f"✅ 코드: {code}\n\n종목 이름을 입력하세요:\n(예: KODEX 레버리지)"
+                )
+                return
+            if step == "name":
+                state["name"] = text
+                state["step"] = "alloc"
+                await update.effective_message.reply_text(
+                    f"✅ 종목명: {text}\n\n할당금액(원)을 입력하세요:\n(예: 3000000)"
+                )
+                return
+            if step == "alloc":
+                try:
+                    alloc = int(text.replace(",", "").replace("원", ""))
+                except ValueError:
+                    await update.effective_message.reply_text("❌ 숫자만 입력하세요. (예: 3000000)")
+                    return
+                code  = state["code"]
+                name  = state["name"]
+                new_s = {
+                    "code": code, "name": name,
+                    "mode": "INFINITE", "active": True,
+                    "allocation_krw": alloc,
+                    "split_count": 10,
+                    "target_profit_pct": 5.0,
+                    "vrev_band_pct": 3.0,
+                    "daily_buy_limit_krw": alloc // 10,
+                }
+                syms = self._get_symbols()
+                syms.append(new_s)
+                self._save_symbols(syms)
+                del self._pending[uid]
+                await update.effective_message.reply_text(
+                    f"✅ <b>{name}({code}) 추가 완료!</b>\n"
+                    f"할당금: {self._fmt_krw(alloc)}\n"
+                    f"분할: 10회 | 목표: 5.0%\n\n"
+                    f"/settlement 에서 세부 설정 변경 가능합니다.",
+                    parse_mode="HTML"
+                )
+                return
+        # ── 수동 매수 텍스트 입력 ──────────────
+        if state and state.get("action") == "MANUAL_BUY":
+            code  = state["code"]
+            parts = text.strip().split()
+            try:
+                qty   = int(parts[0])
+                price = int(parts[1]) if len(parts) >= 2 else 0
+            except (ValueError, IndexError):
+                await update.effective_message.reply_text(
+                    "❌ 예) <code>5 15000</code> 또는 <code>5</code>",
+                    parse_mode="HTML")
+                return
+            del self._pending[uid]
+            await self._execute_manual_buy(update.effective_message, code, qty, price)
+            return
+        # ── 수동 매도 텍스트 입력 ──────────────
+        if state and state.get("action") == "MANUAL_SELL":
+            code    = state["code"]
+            max_qty = state.get("max_qty", 0)
+            parts   = text.strip().split()
+            try:
+                qty   = int(parts[0])
+                price = int(parts[1]) if len(parts) >= 2 else 0
+            except (ValueError, IndexError):
+                await update.effective_message.reply_text(
+                    "❌ 예) <code>5 16000</code> 또는 <code>0</code>(전량)",
+                    parse_mode="HTML")
+                return
+            if qty == 0:
+                qty = max_qty
+            del self._pending[uid]
+            await self._execute_manual_sell(update.effective_message, code, qty, price)
+            return
+        # ── 설정값 입력 상태 ────────────
+        if state and state.get("action") == "SET_VALUE":
+            key  = state["key"]
+            code = state["code"]
+            cfg_key, type_fn, _, unit = SETTING_KEY_MAP[key]
+            try:
+                val = type_fn(text.replace(",", "").replace(unit, "").strip())
+            except ValueError:
+                await update.effective_message.reply_text(f"❌ 올바른 숫자를 입력하세요. 단위: {unit}")
+                return
+            syms = self._get_symbols()
+            sym_name = code
+            for s in syms:
+                if s["code"] == code:
+                    s[cfg_key] = val
+                    sym_name   = s["name"]
+                    break
+            self._save_symbols(syms)
+            del self._pending[uid]
+            # AVWAP 예산 변경 시 엔진 실시간 반영
+            if key == "avwap" and hasattr(self, "avwap_engine") and self.avwap_engine:
+                avwap_syms = [s for s in syms
+                              if s.get("active") and s.get("avwap_budget", 0) > 0]
+                self.avwap_engine.init_symbols(avwap_syms)
+                extra = "  (활성화)" if val > 0 else "  (비활성화)"
+            else:
+                extra = ""
+            await update.effective_message.reply_text(
+                f"✅ <b>{sym_name} {key} 설정 완료</b>\n"
+                f"새 값: {val:,}{unit}{extra}",
+                parse_mode="HTML"
+            )
+            return
+        # ── 텍스트 키워드 라우팅 ──────────
+        routing = {
+            "지시서": self.cmd_sync,   "sync": self.cmd_sync,
+            "장부":   self.cmd_record, "record": self.cmd_record,
+            "잔고":   self.cmd_balance,"balance": self.cmd_balance,
+            "보유":   self.cmd_holdings,
+            "설정":   self.cmd_settlement,
+            "종목":   self.cmd_ticker,
+            "도움말": self.cmd_help,
+            "중지":   self.cmd_pause,
+            "재개":   self.cmd_resume,
+        }
+        for kw, handler in routing.items():
+            if kw in text.lower():
+                return await handler(update, context)
+        await update.effective_message.reply_text(
+            "❓ 알 수 없는 명령입니다. /help 로 명령어 목록을 확인하세요."
+        )

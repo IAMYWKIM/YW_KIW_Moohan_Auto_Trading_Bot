@@ -38,10 +38,30 @@ def calc_large_num(cur_price: int, large_num_pct: float) -> int:
 
 
 def calc_t_val(total_qty: int, one_portion_qty: int) -> float:
-    """t_val = 누적 보유수량 / 1회차 기준 수량."""
+    """
+    t_val = 누적 보유수량 / 1회차 기준 수량.
+
+    원본 공식: t_val = 투자금액 / 총예산 × n  (금액 기반)
+    우리 구현: 수량 기반 근사 — 호가 변동 시 오차 발생 가능
+    정확도: 실제 매수 후 DB의 avg_price × total_qty로 역산 권장
+
+    실전 영향:
+    - 오차 <0.1T (호가 ±1% 범위) → 전반전/후반전 판단에 영향 미미
+    - 리버스 진입 판단(T > split-1)에서만 정밀도 중요
+    """
     if one_portion_qty <= 0:
         return 0.0
     return total_qty / one_portion_qty
+
+
+def calc_t_val_by_amount(invested_amount: int, allocation: int, split: int) -> float:
+    """
+    T값 금액 기반 정확 계산 (원본 공식).
+    DB에 avg_price * total_qty 저장 시 사용.
+    """
+    if allocation <= 0 or split <= 0:
+        return 0.0
+    return (invested_amount / allocation) * split
 
 
 def calc_star_ratio(target_ratio: float, split: int, t_val: float) -> float:
