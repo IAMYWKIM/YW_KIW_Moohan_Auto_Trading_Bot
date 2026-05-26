@@ -1,0 +1,65 @@
+{
+  "_comment": "ETF 무한매매 봇 설정. 봇 재시작 없이 즉시 반영됩니다.",
+  "_version": "2.0",
+
+  "PORTFOLIO": {
+    "122630": {
+      "name": "KODEX 레버리지",
+      "_desc": "코스피 2배 ETF (KOSPI200 × 2)",
+      "mode": "INFINITE",
+      "allocated_capital": 3000000,
+      "daily_buy_limit": 300000,
+      "split_count": 3,
+      "profit_target_pct": 5.0,
+      "enabled": true
+    },
+    "233740": {
+      "name": "KODEX 코스닥150레버리지",
+      "_desc": "코스닥 2배 ETF",
+      "mode": "INFINITE",
+      "allocated_capital": 3000000,
+      "daily_buy_limit": 300000,
+      "split_count": 3,
+      "profit_target_pct": 5.0,
+      "enabled": true
+    },
+    "494310": {
+      "name": "TIGER Fn반도체TOP10레버리지",
+      "_desc": "반도체 2배 ETF — V-REV 모드",
+      "mode": "VREV",
+      "allocated_capital": 3000000,
+      "daily_buy_limit": 300000,
+      "vrev_target_value": 3000000,
+      "vrev_band_pct": 3.0,
+      "enabled": true
+    }
+  },
+
+  "SCHEDULE": {
+    "_comment": "수능일·연말 등 특별 일정 시 여기만 수정하면 재시작 없이 반영",
+    "START_TIME": "09:00",
+    "END_TIME": "15:20",
+    "PRE_CLOSE_START": "15:10",
+    "PRE_CLOSE_END": "15:20",
+    "CLOSING_AUCTION_START": "15:20",
+    "CLOSING_AUCTION_END": "15:30",
+    "MORNING_CHECK_TIME": "08:50",
+    "VREV_START": "14:30",
+    "VREV_END": "15:00",
+    "EOD_REPORT_TIME": "15:35"
+  },
+
+  "SAFETY": {
+    "MIN_CASH_BUFFER_PCT": 10.0,
+    "MAX_ORDER_RETRY": 3,
+    "ORDER_WAIT_SEC": 30,
+    "HALT_ON_LOW_CASH": true
+  },
+
+  "TELEGRAM": {
+    "SEND_OPEN_ALERT": true,
+    "SEND_TRADE_ALERT": true,
+    "SEND_CLOSE_REPORT": true,
+    "SEND_VREV_ALERT": true
+  }
+}

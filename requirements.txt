@@ -1,0 +1,29 @@
+# ==============================================================
+# requirements.txt — 국내 ETF 무한매매 봇 v3.0
+# python-telegram-bot v20+ (Application + run_polling 필수)
+# ==============================================================
+
+# 텔레그램 봇 핵심 — job-queue 포함 필수
+python-telegram-bot[job-queue]>=20.7
+
+# HTTP 요청
+requests>=2.31.0
+
+# 환경 변수 관리
+python-dotenv>=1.0.0
+
+# 시간대 (Python 3.9+ zoneinfo 내장 — 별도 설치 불필요)
+# pytz 는 레거시 의존 코드에서 사용 시에만 추가
+pytz>=2024.1
+
+# 스케줄링 (python-telegram-bot job_queue 내부에서 APScheduler 사용)
+APScheduler>=3.10.0
+
+# 국내 시장 캘린더 (휴장일 판별)
+holidays>=0.45
+
+# 데이터 처리
+pandas>=2.1.0
+
+# 한국 거래소 호가 단위 계산 등 수치 연산
+numpy>=1.26.0

@@ -1,0 +1,47 @@
+{
+  "SYMBOLS": [
+    {
+      "code": "122630",
+      "name": "KODEX 레버리지",
+      "mode": "INFINITE",
+      "active": true,
+      "allocation_krw": 3000000,
+      "split_count": 10,
+      "target_profit_pct": 5.0,
+      "large_num_pct": 15.0,
+      "vrev_band_pct": 3.0,
+      "daily_buy_limit_krw": 300000,
+      "avwap_budget": 0
+    },
+    {
+      "code": "233740",
+      "name": "KODEX 코스닥150레버리지",
+      "mode": "INFINITE",
+      "active": true,
+      "allocation_krw": 3000000,
+      "split_count": 10,
+      "target_profit_pct": 5.0,
+      "large_num_pct": 15.0,
+      "vrev_band_pct": 3.0,
+      "daily_buy_limit_krw": 300000,
+      "avwap_budget": 0
+    },
+    {
+      "code": "488080",
+      "name": "KODEX 반도체TOP10레버리지",
+      "mode": "INFINITE",
+      "active": false,
+      "allocation_krw": 10000000,
+      "split_count": 20,
+      "target_profit_pct": 20.0,
+      "large_num_pct": 15.0,
+      "vrev_band_pct": 3.0,
+      "daily_buy_limit_krw": 500000,
+      "avwap_budget": 0
+    }
+  ],
+  "TRADE_MODE": "MOCK",
+  "BOT_PAUSED": false,
+  "START_TIME": "09:00",
+  "END_TIME": "15:20"
+}
