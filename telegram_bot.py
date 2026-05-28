@@ -39,6 +39,16 @@ from trading_engine import (
     calc_target_price, calc_one_portion_qty, plan_loc_buy,
 )
 from kiwoom_api import round_to_tick
+
+# ── 버전 정보 (version.py 없어도 동작) ─────────────────────
+VERSION_TAG = "v5.0"
+def get_telegram_version_text(active_symbols=None): return None
+HISTORY = []
+try:
+    from version import VERSION_TAG, get_telegram_version_text, HISTORY
+except Exception:
+    pass  # version.py 없으면 기본값 사용
+
 log = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 # 기본 종목 목록
@@ -82,7 +92,7 @@ SETTING_KEY_MAP = {
 # TelegramController
 # ==============================================================
 class TelegramController:
-    VERSION = "v4.0"
+    VERSION = VERSION_TAG
     def __init__(self, cfg, broker, db, notifier, trading_engine, admin_chat_id: int):
         self.cfg      = cfg
         self.broker   = broker
@@ -1307,7 +1317,8 @@ class TelegramController:
             avwap = "  ⚡️AVWAP ON" if ab > 0 else ""
             sym_lines += f"  {icons} {s['name']} ({s['code']}){avwap}\n"
 
-        msg = (
+        syms_for_ver = self._get_active_symbols()
+        msg = get_telegram_version_text(syms_for_ver) or (
             f"🔧 <b>[ 버전 및 업데이트 내역 ]</b>\n"
             f"\n"
             f"🚀 <b>국내 ETF 무한매매 + AVWAP 봇</b>\n"
@@ -1842,22 +1853,59 @@ class TelegramController:
         if data.startswith("AVWAP:"):
             parts  = data.split(":")
             action = parts[1]
+
             if action == "REFRESH":
-                if hasattr(self, "avwap_engine") and self.avwap_engine:
+                # avwap_engine 없으면 안내 메시지 표시 (무반응 방지)
+                if not hasattr(self, "avwap_engine") or not self.avwap_engine:
+                    kb = [[InlineKeyboardButton(
+                        "⚙️ 설정에서 AVWAP 켜기",
+                        callback_data="CMD:settlement"
+                    )]]
                     await query.edit_message_text(
-                        self.avwap_engine.get_status_text(),
+                        "⚡️ <b>AVWAP 엔진</b>\n\n"
+                        "현재 비활성 상태입니다.\n\n"
+                        "활성화 방법:\n"
+                        "1️⃣ /settlement → 종목 선택\n"
+                        "2️⃣ <code>💤 AVWAP OFF</code> 버튼 클릭\n"
+                        "3️⃣ 예산 확인 후 자동 활성화\n\n"
+                        "또는 data/config.json에서\n"
+                        "<code>avwap_budget: 1000000</code> 설정",
                         parse_mode="HTML",
-                        reply_markup=query.message.reply_markup
+                        reply_markup=InlineKeyboardMarkup(kb)
                     )
+                    return
+
+                txt = self.avwap_engine.get_status_text()
+                kb  = [[
+                    InlineKeyboardButton("🔄 새로고침", callback_data="AVWAP:REFRESH")
+                ]]
+                # 종목별 상세 버튼 추가
+                for code in list(self.avwap_engine.states.keys()):
+                    st = self.avwap_engine.states[code]
+                    kb.append([InlineKeyboardButton(
+                        f"🔍 {st.name} 상세",
+                        callback_data=f"AVWAP:STATUS:{code}"
+                    )])
+                await query.edit_message_text(
+                    txt, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
                 return
+
             if action == "STATUS" and len(parts) == 3:
                 code = parts[2]
-                if hasattr(self, "avwap_engine") and self.avwap_engine:
-                    await query.edit_message_text(
-                        self.avwap_engine.get_status_text(code),
-                        parse_mode="HTML",
-                        reply_markup=query.message.reply_markup
-                    )
+                if not hasattr(self, "avwap_engine") or not self.avwap_engine:
+                    await query.answer("AVWAP 엔진이 비활성 상태입니다.", show_alert=True)
+                    return
+                txt = self.avwap_engine.get_status_text(code)
+                kb  = [[
+                    InlineKeyboardButton("◀ 전체 보기", callback_data="AVWAP:REFRESH"),
+                    InlineKeyboardButton("🔄 새로고침", callback_data=f"AVWAP:STATUS:{code}"),
+                ]]
+                await query.edit_message_text(
+                    txt, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
                 return
 
         if data.startswith("SYNCDB:"):
