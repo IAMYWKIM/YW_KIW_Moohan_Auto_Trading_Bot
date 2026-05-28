@@ -271,12 +271,21 @@ class KiwoomBroker:
     # ----------------------------------------------------------
     def get_balance(self) -> dict:
         """
-        kt00018 계좌평가잔고내역
+        kt00001 주식잔고2 — 예수금/주문가능금액 조회
         반환: {deposit, withdrawable, eval_total, eval_profit, profit_pct}
+
+        kt00018 대신 kt00001 사용 이유:
+          kt00018은 dmst_stex_tp 파라미터 오류(501307)로 실전 계좌 조회 불가
+          kt00001은 동일 파라미터로 정상 조회됨 (실전 검증 완료)
+
+        kt00001 주요 응답 필드:
+          entr         = 예수금
+          ord_alow_amt = 주문가능금액
+          elwdpst_evlta= 평가금액 합계
         """
         data = self._post(
-            "kt00018", "/api/dostk/acnt",
-            {"qry_tp": "1", "dmst_stex_tp": "KRX"},
+            "kt00001", "/api/dostk/acnt",
+            {"qry_tp": "1"},
         )
 
         def ti(s):
@@ -285,22 +294,30 @@ class KiwoomBroker:
             except Exception:
                 return 0
 
-        deposit      = ti(data.get("ord_alowa",    "0"))   # 출금가능
-        withdrawable = deposit
-        eval_total   = ti(data.get("tot_evlt_amt", "0"))   # 총평가금액
-        eval_profit  = ti(data.get("tot_evlt_pl",  "0"))   # 총평가손익
+        deposit      = ti(data.get("entr",          "0"))  # 예수금
+        withdrawable = ti(data.get("ord_alow_amt",  "0"))  # 주문가능금액
+        eval_total   = ti(data.get("elwdpst_evlta", "0"))  # 평가금액
 
-        try:
-            profit_pct = float(data.get("tot_prft_rt", "0"))
-        except Exception:
-            profit_pct = 0.0
+        # 보유종목 평가손익 합산
+        eval_profit = 0
+        for item in data.get("stk_entr_prst", []):
+            try:
+                eval_profit += int(str(item.get("evlt_pl_amt", "0")).lstrip("0+-") or "0")
+            except Exception:
+                pass
 
+        profit_pct = (eval_profit / eval_total * 100) if eval_total > 0 else 0.0
+
+        log.debug(
+            f"[Broker] 잔고 — 예수금:{deposit:,} "
+            f"주문가능:{withdrawable:,} 평가:{eval_total:,}"
+        )
         return {
             "deposit":      deposit,
             "withdrawable": withdrawable,
             "eval_total":   eval_total,
             "eval_profit":  eval_profit,
-            "profit_pct":   profit_pct,
+            "profit_pct":   round(profit_pct, 2),
         }
 
     # ----------------------------------------------------------
@@ -308,12 +325,14 @@ class KiwoomBroker:
     # ----------------------------------------------------------
     def get_holdings(self) -> list:
         """
-        kt00018 보유 종목 리스트
+        kt00001 보유 종목 리스트 (kt00018 대체)
         반환: [{code, name, qty, avg_price, current_price, profit, profit_pct}]
+
+        kt00001 응답의 stk_entr_prst 배열에서 보유종목 파싱
         """
         data = self._post(
-            "kt00018", "/api/dostk/acnt",
-            {"qry_tp": "1", "dmst_stex_tp": "KRX"},
+            "kt00001", "/api/dostk/acnt",
+            {"qry_tp": "1"},
         )
 
         def ti(s):
@@ -323,7 +342,7 @@ class KiwoomBroker:
                 return 0
 
         holdings = []
-        for item in data.get("acnt_evlt_remn_indv_tot", []):
+        for item in data.get("stk_entr_prst", []):
             qty = ti(item.get("rmnd_qty", "0"))
             if qty == 0:
                 continue
