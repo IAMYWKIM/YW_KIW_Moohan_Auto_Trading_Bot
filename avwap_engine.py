@@ -482,6 +482,9 @@ class AVWAPEngine:
             signal_icon = "🟢 진입가능" if can_enter else f"🔴 {reason[:20]}"
             lock_icon   = "🔒 당일동결" if st.day_locked else signal_icon
 
+            # 데이터 유무 판단 (장 마감 후는 정상적으로 0)
+            no_data = (intraday_vwap <= 0 and st.atr5 <= 0)
+
             lines += [
                 f"💎 <b>{st.name}</b> ({c})",
                 f"  상태: {lock_icon}",
@@ -491,17 +494,19 @@ class AVWAPEngine:
                 f"  5분MA: {vwap_5m_avg:,.0f}원",
                 f"  ATR5: {st.atr5:,.0f}원  잔여체력: {remaining_pct:.1f}%",
             ]
+            if no_data:
+                lines.append(
+                    "  ⚠️ VWAP 데이터 없음 — 장중(09:30~14:30)에만 수집\n"
+                    "  → 내일 09:30 교전 시작 시 자동 활성화"
+                )
             if st.position_qty > 0:
                 lines.append(
-                    f"  📊 보유: {st.position_qty:,}주 "
-                    f"@ {st.position_avg:,}원"
+                    f"  📊 보유: {st.position_qty:,}주 @ {st.position_avg:,}원"
                 )
             lines += [
-                f"  💰 당일손익: {st.today_pnl:+,}원  "
-                f"출장: {st.today_trades}회",
+                f"  💰 당일손익: {st.today_pnl:+,}원  출장: {st.today_trades}회",
                 "",
             ]
-        return "\n".join(lines)
 
     @staticmethod
     def _status_icon(status: str) -> str:

@@ -191,16 +191,33 @@ async def _avwap_morning_reset(context):
         except Exception:
             pass
 
-        # ATR5 업데이트
+        # ATR5 업데이트 (전일 OHLCV 기반 실제 계산)
         try:
+            import math
             for code, st in avwap_engine.states.items():
-                info = broker.get_stock_info(code)
-                cur  = info.get("cur_price", 0)
-                if cur > 0:
-                    # ATR5 추정: 현재가 × 일간변동성 × sqrt(5)
-                    import math
-                    est_atr5 = cur * 0.03 * math.sqrt(5)
-                    avwap_engine.update_atr5(code, est_atr5)
+                info     = broker.get_stock_info(code)
+                cur      = info.get("cur_price", 0)
+                prev_cls = info.get("prev_close", 0)
+                day_h    = info.get("day_high", 0)
+                day_l    = info.get("day_low",  0)
+                if cur > 0 and prev_cls > 0:
+                    # True Range = max(당일고-당일저, |당일고-전일종가|, |당일저-전일종가|)
+                    # ATR5 추정 = 최근 5일 평균 TR (오늘 TR × 5일 근사)
+                    tr_today = max(
+                        day_h - day_l if day_h > 0 and day_l > 0 else 0,
+                        abs(day_h - prev_cls) if day_h > 0 else 0,
+                        abs(day_l - prev_cls) if day_l > 0 else 0,
+                    )
+                    # TR이 없으면 전일종가 × 일간변동성 추정 (2배 레버리지 기준 3%)
+                    if tr_today <= 0:
+                        tr_today = int(prev_cls * 0.03)
+                    # ATR5 = 오늘 TR 가중 (실제는 5일 평균, 근사값)
+                    atr5 = max(tr_today, int(cur * 0.015))
+                    avwap_engine.update_atr5(code, float(atr5))
+                    log.info(
+                        f"[Main] {code} ATR5 업데이트: {atr5:,}원 "
+                        f"(TR={tr_today:,} / Amp5={atr5/cur*100:.1f}%)"
+                    )
         except Exception as e:
             log.warning(f"[Main] ATR5 업데이트 실패: {e}")
 
