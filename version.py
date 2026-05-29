@@ -14,11 +14,11 @@
 # 현재 버전 정보
 # ==============================================================
 CURRENT = {
-    "version":     "5.0",
-    "date":        "2026-05-26",
+    "version":     "6.0",
+    "date":        "2026-05-29",
     "codename":    "AVWAP Dual Momentum",
     "bot_name":    "국내 ETF 무한매매 + AVWAP 봇",
-    "description": "승승장군 V44~V79 AVWAP 퀀트 엔진 탑재 (진입조건 v2.0 수정)",
+    "description": "승승장군 issues #59~#66 완전 재분석, V-REV SMA5 알고리즘, AVWAP v2.0",
     "strategies":  ["INFINITE", "V-REV", "AVWAP"],
     "api":         "키움증권 REST API",
     "platform":    "GCP Ubuntu + python-telegram-bot v20+",
@@ -34,6 +34,18 @@ RELEASE_DATE  = CURRENT["date"]
 # 변경 이력 (최신 → 오래된 순)
 # ==============================================================
 HISTORY = [
+    {
+        "version": "6.0",
+        "date":    "2026-05-29",
+        "emoji":   "🔥",
+        "changes": [
+            "V-REV 알고리즘 완전 재구현 — 승승장군 원본 SMA5 기준 역추세 (issues #59 #61)",
+            "V-REV 실행 시간: 09:10 편차계산 → 15:10 동시호가 LOC (원본과 동일)",
+            "V-REV 매수: 현재가 < SMA5 시 동시호가 / 매도: 현재가 > SMA5 시 팝(Pop)",
+            "scheduler_trade.py vrev_loc_start() 15:10 신규 Job 추가",
+            "build_sync_plan() V-REV 모드 SMA5 기반 주문계획 표시",
+        ],
+    },
     {
         "version": "5.0",
         "date":    "2026-05-26",

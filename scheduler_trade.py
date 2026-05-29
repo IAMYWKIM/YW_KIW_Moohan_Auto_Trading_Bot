@@ -90,9 +90,11 @@ class TradeScheduler:
             self.notifier.notify_error("auction_order", str(e))
 
     # ----------------------------------------------------------
-    # V-REV 리밸런싱 (09:10)
+    # V-REV 오전 상태 확인 (09:10) — 실매매 없음
+    # 승승장군 원본: V-REV 실매매는 15:10 LOC와 함께 실행
     # ----------------------------------------------------------
     async def vrev_rebalance(self, context: ContextTypes.DEFAULT_TYPE):
+        """09:10: V-REV 상태 확인만 (로그). 실매매는 loc_buy_start()에서."""
         if self._is_trading_paused():
             return
         if not self.calendar.is_trading_day():
@@ -100,13 +102,39 @@ class TradeScheduler:
 
         cfg = self.broker.cfg
         symbols = cfg.get("SYMBOLS", [])
-        vrev_symbols = [s for s in symbols if s.get("mode") == "VREV" and s.get("active", True)]
+        vrev_symbols = [s for s in symbols
+                        if s.get("mode") == "VREV" and s.get("active", True)]
         if not vrev_symbols:
             return
 
-        log.info(f"[TradeSched] V-REV 리밸런싱 시작 — {len(vrev_symbols)}종목")
+        log.info(f"[TradeSched] V-REV 오전 상태 확인 ({len(vrev_symbols)}종목) — 실매매는 15:10")
         try:
             await self.engine.vrev_rebalance(vrev_symbols)
         except Exception as e:
-            log.exception("[TradeSched] V-REV 리밸런싱 실패")
-            self.notifier.notify_error("vrev_rebalance", str(e))
+            log.exception("[TradeSched] V-REV 상태 확인 실패")
+
+    # ----------------------------------------------------------
+    # V-REV LOC 매수/매도 (15:10 — 무한매매와 동시 실행)
+    # 승승장군 원본: 5MA 기준 역추세, 동시호가
+    # ----------------------------------------------------------
+    async def vrev_loc_start(self, context: ContextTypes.DEFAULT_TYPE):
+        """15:10: V-REV 동시호가 매수/매도 (SMA5 기준)."""
+        if self._is_trading_paused():
+            log.info("[TradeSched] BOT_PAUSED — V-REV LOC 건너뜀")
+            return
+        if not self.calendar.is_trading_day():
+            return
+
+        cfg = self.broker.cfg
+        symbols = cfg.get("SYMBOLS", [])
+        vrev_symbols = [s for s in symbols
+                        if s.get("mode") == "VREV" and s.get("active", True)]
+        if not vrev_symbols:
+            return
+
+        log.info(f"[TradeSched] V-REV LOC 매수/매도 시작 (15:10) — {len(vrev_symbols)}종목")
+        try:
+            await self.engine.vrev_loc()
+        except Exception as e:
+            log.exception("[TradeSched] V-REV LOC 실패")
+            self.notifier.notify_error("vrev_loc_start", str(e))

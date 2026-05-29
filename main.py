@@ -142,6 +142,10 @@ def register_jobs(app, broker, db, notifier, engine, calendar, avwap_engine):
     jq.run_daily(trade_sched.loc_buy_start,
                  time=datetime.time(15, 10, tzinfo=KST),
                  days=(0,1,2,3,4), chat_id=TELEGRAM_CHAT_ID, data=data)
+    # V-REV LOC: 승승장군 원본 알고리즘 — 15:10 동시호가 SMA5 기준
+    jq.run_daily(trade_sched.vrev_loc_start,
+                 time=datetime.time(15, 10, tzinfo=KST),
+                 days=(0,1,2,3,4), chat_id=TELEGRAM_CHAT_ID, data=data)
     jq.run_daily(trade_sched.auction_order,
                  time=datetime.time(15, 20, tzinfo=KST),
                  days=(0,1,2,3,4), chat_id=TELEGRAM_CHAT_ID, data=data)
